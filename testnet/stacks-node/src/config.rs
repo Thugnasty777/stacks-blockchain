@@ -7,9 +7,11 @@ use rand::RngCore;
 
 use stacks::burnchains::bitcoin::BitcoinNetworkType;
 use stacks::burnchains::{MagicBytes, BLOCKSTACK_MAGIC_MAINNET};
+use stacks::chainstate::stacks::miner::BlockBuilderSettings;
+use stacks::core::mempool::MemPoolWalkSettings;
 use stacks::core::{
-    BLOCK_LIMIT_MAINNET, CHAIN_ID_MAINNET, CHAIN_ID_TESTNET, PEER_VERSION_MAINNET,
-    PEER_VERSION_TESTNET,
+    BLOCK_LIMIT_MAINNET, CHAIN_ID_MAINNET, CHAIN_ID_TESTNET, HELIUM_BLOCK_LIMIT,
+    PEER_VERSION_MAINNET, PEER_VERSION_TESTNET,
 };
 use stacks::net::connection::ConnectionOptions;
 use stacks::net::{Neighbor, NeighborKey, PeerAddress};
@@ -34,7 +36,7 @@ pub struct ConfigFile {
     pub ustx_balance: Option<Vec<InitialBalanceFile>>,
     pub events_observer: Option<Vec<EventObserverConfigFile>>,
     pub connection_options: Option<ConnectionOptionsFile>,
-    pub block_limit: Option<BlockLimitFile>,
+    pub miner: Option<MinerConfigFile>,
 }
 
 #[derive(Clone, Deserialize, Default)]
@@ -51,19 +53,19 @@ mod tests {
         let config = ConfigFile::from_str(
             r#"
             [[ustx_balance]]
-            address = "STB44HYPYAT2BB2QE513NSP81HTMYWBJP02HPGK6"
+            address = "ST2QKZ4FKHAH1NQKYKYAYZPY440FEPK7GZ1R5HBP2"
             amount = 10000000000000000
 
             [[ustx_balance]]
-            address = "ST11NJTTKGVT6D1HY4NJRVQWMQM7TVAR091EJ8P2Y"
+            address = "ST319CF5WV77KYR1H3GT0GZ7B8Q4AQPY42ETP1VPF"
             amount = 10000000000000000
 
             [[mstx_balance]] # legacy property name
-            address = "ST1HB1T8WRNBYB0Y3T7WXZS38NKKPTBR3EG9EPJKR"
+            address = "ST221Z6TDTC5E0BYR2V624Q2ST6R0Q71T78WTAX6H"
             amount = 10000000000000000
 
             [[mstx_balance]] # legacy property name
-            address = "STRYYQQ9M8KAF4NS7WNZQYY59X93XEKR31JP64CP"
+            address = "ST2TFVBMRPS5SSNP98DQKQ5JNB2B6NZM91C4K3P7B"
             amount = 10000000000000000
             "#,
         );
@@ -74,19 +76,19 @@ mod tests {
         assert_eq!(balances.len(), 4);
         assert_eq!(
             balances[0].address,
-            "STB44HYPYAT2BB2QE513NSP81HTMYWBJP02HPGK6"
+            "ST2QKZ4FKHAH1NQKYKYAYZPY440FEPK7GZ1R5HBP2"
         );
         assert_eq!(
             balances[1].address,
-            "ST11NJTTKGVT6D1HY4NJRVQWMQM7TVAR091EJ8P2Y"
+            "ST319CF5WV77KYR1H3GT0GZ7B8Q4AQPY42ETP1VPF"
         );
         assert_eq!(
             balances[2].address,
-            "ST1HB1T8WRNBYB0Y3T7WXZS38NKKPTBR3EG9EPJKR"
+            "ST221Z6TDTC5E0BYR2V624Q2ST6R0Q71T78WTAX6H"
         );
         assert_eq!(
             balances[3].address,
-            "STRYYQQ9M8KAF4NS7WNZQYY59X93XEKR31JP64CP"
+            "ST2TFVBMRPS5SSNP98DQKQ5JNB2B6NZM91C4K3P7B"
         );
     }
 }
@@ -110,141 +112,13 @@ impl ConfigFile {
         config
     }
 
-    pub fn neon() -> ConfigFile {
-        let burnchain = BurnchainConfigFile {
-            mode: Some("neon".to_string()),
-            rpc_port: Some(18443),
-            peer_port: Some(18444),
-            peer_host: Some("neon.blockstack.org".to_string()),
-            ..BurnchainConfigFile::default()
-        };
-
-        let node = NodeConfigFile {
-            bootstrap_node: Some("038dd4f26101715853533dee005f0915375854fd5be73405f679c1917a5d4d16aa@neon.blockstack.org:20444".to_string()),
-            miner: Some(false),
-            ..NodeConfigFile::default()
-        };
-
-        let balances = vec![
-            InitialBalanceFile {
-                address: "STB44HYPYAT2BB2QE513NSP81HTMYWBJP02HPGK6".to_string(),
-                amount: 10000000000000000,
-            },
-            InitialBalanceFile {
-                address: "ST11NJTTKGVT6D1HY4NJRVQWMQM7TVAR091EJ8P2Y".to_string(),
-                amount: 10000000000000000,
-            },
-            InitialBalanceFile {
-                address: "ST1HB1T8WRNBYB0Y3T7WXZS38NKKPTBR3EG9EPJKR".to_string(),
-                amount: 10000000000000000,
-            },
-            InitialBalanceFile {
-                address: "STRYYQQ9M8KAF4NS7WNZQYY59X93XEKR31JP64CP".to_string(),
-                amount: 10000000000000000,
-            },
-        ];
-
-        ConfigFile {
-            burnchain: Some(burnchain),
-            node: Some(node),
-            ustx_balance: Some(balances),
-            ..ConfigFile::default()
-        }
-    }
-
-    pub fn argon() -> ConfigFile {
-        let burnchain = BurnchainConfigFile {
-            mode: Some("argon".to_string()),
-            rpc_port: Some(18443),
-            peer_port: Some(18444),
-            peer_host: Some("argon.blockstack.org".to_string()),
-            process_exit_at_block_height: Some(28160), // 1 block every 30s, 24 hours * 8 + 300 blocks initially mined for seeding faucet / miner
-            ..BurnchainConfigFile::default()
-        };
-
-        let node = NodeConfigFile {
-            bootstrap_node: Some("048dd4f26101715853533dee005f0915375854fd5be73405f679c1917a5d4d16aaaf3c4c0d7a9c132a36b8c5fe1287f07dad8c910174d789eb24bdfb5ae26f5f27@argon.blockstack.org:20444".to_string()),
-            miner: Some(false),
-            ..NodeConfigFile::default()
-        };
-
-        let balances = vec![
-            InitialBalanceFile {
-                address: "STB44HYPYAT2BB2QE513NSP81HTMYWBJP02HPGK6".to_string(),
-                amount: 10000000000000000,
-            },
-            InitialBalanceFile {
-                address: "ST11NJTTKGVT6D1HY4NJRVQWMQM7TVAR091EJ8P2Y".to_string(),
-                amount: 10000000000000000,
-            },
-            InitialBalanceFile {
-                address: "ST1HB1T8WRNBYB0Y3T7WXZS38NKKPTBR3EG9EPJKR".to_string(),
-                amount: 10000000000000000,
-            },
-            InitialBalanceFile {
-                address: "STRYYQQ9M8KAF4NS7WNZQYY59X93XEKR31JP64CP".to_string(),
-                amount: 10000000000000000,
-            },
-        ];
-
-        ConfigFile {
-            burnchain: Some(burnchain),
-            node: Some(node),
-            ustx_balance: Some(balances),
-            ..ConfigFile::default()
-        }
-    }
-
-    pub fn krypton() -> ConfigFile {
-        let burnchain = BurnchainConfigFile {
-            mode: Some("krypton".to_string()),
-            rpc_port: Some(18443),
-            peer_port: Some(18444),
-            peer_host: Some("bitcoind.krypton.blockstack.org".to_string()),
-            process_exit_at_block_height: Some(5130), // 1 block every 2m, 24 hours * 7 + 300 blocks initially mined for seeding faucet / miner
-            ..BurnchainConfigFile::default()
-        };
-
-        let node = NodeConfigFile {
-            bootstrap_node: Some("048dd4f26101715853533dee005f0915375854fd5be73405f679c1917a5d4d16aaaf3c4c0d7a9c132a36b8c5fe1287f07dad8c910174d789eb24bdfb5ae26f5f27@krypton.blockstack.org:20444".to_string()),
-            miner: Some(false),
-            ..NodeConfigFile::default()
-        };
-
-        let balances = vec![
-            InitialBalanceFile {
-                address: "STB44HYPYAT2BB2QE513NSP81HTMYWBJP02HPGK6".to_string(),
-                amount: 10000000000000000,
-            },
-            InitialBalanceFile {
-                address: "ST11NJTTKGVT6D1HY4NJRVQWMQM7TVAR091EJ8P2Y".to_string(),
-                amount: 10000000000000000,
-            },
-            InitialBalanceFile {
-                address: "ST1HB1T8WRNBYB0Y3T7WXZS38NKKPTBR3EG9EPJKR".to_string(),
-                amount: 10000000000000000,
-            },
-            InitialBalanceFile {
-                address: "STRYYQQ9M8KAF4NS7WNZQYY59X93XEKR31JP64CP".to_string(),
-                amount: 10000000000000000,
-            },
-        ];
-
-        ConfigFile {
-            burnchain: Some(burnchain),
-            node: Some(node),
-            ustx_balance: Some(balances),
-            ..ConfigFile::default()
-        }
-    }
-
     pub fn xenon() -> ConfigFile {
         let burnchain = BurnchainConfigFile {
             mode: Some("xenon".to_string()),
             rpc_port: Some(18332),
             peer_port: Some(18333),
             peer_host: Some("bitcoind.xenon.blockstack.org".to_string()),
-            magic_bytes: Some("X6".into()),
+            magic_bytes: Some("T2".into()),
             ..BurnchainConfigFile::default()
         };
 
@@ -256,19 +130,19 @@ impl ConfigFile {
 
         let balances = vec![
             InitialBalanceFile {
-                address: "STB44HYPYAT2BB2QE513NSP81HTMYWBJP02HPGK6".to_string(),
+                address: "ST2QKZ4FKHAH1NQKYKYAYZPY440FEPK7GZ1R5HBP2".to_string(),
                 amount: 10000000000000000,
             },
             InitialBalanceFile {
-                address: "ST11NJTTKGVT6D1HY4NJRVQWMQM7TVAR091EJ8P2Y".to_string(),
+                address: "ST319CF5WV77KYR1H3GT0GZ7B8Q4AQPY42ETP1VPF".to_string(),
                 amount: 10000000000000000,
             },
             InitialBalanceFile {
-                address: "ST1HB1T8WRNBYB0Y3T7WXZS38NKKPTBR3EG9EPJKR".to_string(),
+                address: "ST221Z6TDTC5E0BYR2V624Q2ST6R0Q71T78WTAX6H".to_string(),
                 amount: 10000000000000000,
             },
             InitialBalanceFile {
-                address: "STRYYQQ9M8KAF4NS7WNZQYY59X93XEKR31JP64CP".to_string(),
+                address: "ST2TFVBMRPS5SSNP98DQKQ5JNB2B6NZM91C4K3P7B".to_string(),
                 amount: 10000000000000000,
             },
         ];
@@ -359,9 +233,41 @@ impl ConfigFile {
             ..NodeConfigFile::default()
         };
 
+        let balances = vec![
+            InitialBalanceFile {
+                // "mnemonic": "point approve language letter cargo rough similar wrap focus edge polar task olympic tobacco cinnamon drop lawn boring sort trade senior screen tiger climb",
+                // "privateKey": "539e35c740079b79f931036651ad01f76d8fe1496dbd840ba9e62c7e7b355db001",
+                // "btcAddress": "n1htkoYKuLXzPbkn9avC2DJxt7X85qVNCK",
+                address: "ST3EQ88S02BXXD0T5ZVT3KW947CRMQ1C6DMQY8H19".to_string(),
+                amount: 10000000000000000,
+            },
+            InitialBalanceFile {
+                // "mnemonic": "laugh capital express view pull vehicle cluster embark service clerk roast glance lumber glove purity project layer lyrics limb junior reduce apple method pear",
+                // "privateKey": "075754fb099a55e351fe87c68a73951836343865cd52c78ae4c0f6f48e234f3601",
+                // "btcAddress": "n2ZGZ7Zau2Ca8CLHGh11YRnLw93b4ufsDR",
+                address: "ST3KCNDSWZSFZCC6BE4VA9AXWXC9KEB16FBTRK36T".to_string(),
+                amount: 10000000000000000,
+            },
+            InitialBalanceFile {
+                // "mnemonic": "level garlic bean design maximum inhale daring alert case worry gift frequent floor utility crowd twenty burger place time fashion slow produce column prepare",
+                // "privateKey": "374b6734eaff979818c5f1367331c685459b03b1a2053310906d1408dc928a0001",
+                // "btcAddress": "mhY4cbHAFoXNYvXdt82yobvVuvR6PHeghf",
+                address: "STB2BWB0K5XZGS3FXVTG3TKS46CQVV66NAK3YVN8".to_string(),
+                amount: 10000000000000000,
+            },
+            InitialBalanceFile {
+                // "mnemonic": "drop guess similar uphold alarm remove fossil riot leaf badge lobster ability mesh parent lawn today student olympic model assault syrup end scorpion lab",
+                // "privateKey": "26f235698d02803955b7418842affbee600fc308936a7ca48bf5778d1ceef9df01",
+                // "btcAddress": "mkEDDqbELrKYGUmUbTAyQnmBAEz4V1MAro",
+                address: "STSTW15D618BSZQB85R058DS46THH86YQQY6XCB7".to_string(),
+                amount: 10000000000000000,
+            },
+        ];
+
         ConfigFile {
             burnchain: Some(burnchain),
             node: Some(node),
+            ustx_balance: Some(balances),
             ..ConfigFile::default()
         }
     }
@@ -374,6 +280,7 @@ pub struct Config {
     pub initial_balances: Vec<InitialBalance>,
     pub events_observers: Vec<EventObserverConfig>,
     pub connection_options: ConnectionOptions,
+    pub miner: MinerConfig,
     pub block_limit: ExecutionCost,
 }
 
@@ -407,15 +314,6 @@ lazy_static! {
         .. std::default::Default::default()
     };
 }
-
-pub const HELIUM_BLOCK_LIMIT: ExecutionCost = ExecutionCost {
-    write_length: 15_0_000_000,
-    write_count: 5_0_000,
-    read_length: 1_000_000_000,
-    read_count: 5_0_000,
-    // allow much more runtime in helium blocks than mainnet
-    runtime: 100_000_000_000,
-};
 
 impl Config {
     pub fn from_config_file(config_file: ConfigFile) -> Config {
@@ -506,9 +404,6 @@ impl Config {
                             );
                         }
                     }
-                    if config_file.block_limit.is_some() {
-                        panic!("Attempted to run mainnet node with a specified `block_limit`");
-                    }
                 }
 
                 BurnchainConfig {
@@ -587,6 +482,20 @@ impl Config {
                 }
             }
             None => default_burnchain_config,
+        };
+
+        let miner_default_config = MinerConfig::default();
+        let miner = match config_file.miner {
+            Some(ref miner) => MinerConfig {
+                min_tx_fee: miner.min_tx_fee.unwrap_or(miner_default_config.min_tx_fee),
+                first_attempt_time_ms: miner
+                    .first_attempt_time_ms
+                    .unwrap_or(miner_default_config.first_attempt_time_ms),
+                subsequent_attempt_time_ms: miner
+                    .subsequent_attempt_time_ms
+                    .unwrap_or(miner_default_config.subsequent_attempt_time_ms),
+            },
+            None => miner_default_config,
         };
 
         let supported_modes = vec![
@@ -764,9 +673,9 @@ impl Config {
                     walk_interval: opts
                         .walk_interval
                         .unwrap_or_else(|| HELIUM_DEFAULT_CONNECTION_OPTIONS.walk_interval.clone()),
-                    dns_timeout: opts
-                        .dns_timeout
-                        .unwrap_or_else(|| HELIUM_DEFAULT_CONNECTION_OPTIONS.dns_timeout.clone()),
+                    dns_timeout: opts.dns_timeout.unwrap_or_else(|| {
+                        HELIUM_DEFAULT_CONNECTION_OPTIONS.dns_timeout.clone() as u64
+                    }) as u128,
                     max_inflight_blocks: opts.max_inflight_blocks.unwrap_or_else(|| {
                         HELIUM_DEFAULT_CONNECTION_OPTIONS
                             .max_inflight_blocks
@@ -821,28 +730,7 @@ impl Config {
             None => HELIUM_DEFAULT_CONNECTION_OPTIONS.clone(),
         };
 
-        let block_limit = if burnchain.mode == "mainnet" || burnchain.mode == "xenon" {
-            BLOCK_LIMIT_MAINNET.clone()
-        } else {
-            match config_file.block_limit {
-                Some(opts) => ExecutionCost {
-                    write_length: opts
-                        .write_length
-                        .unwrap_or(HELIUM_BLOCK_LIMIT.write_length.clone()),
-                    write_count: opts
-                        .write_count
-                        .unwrap_or(HELIUM_BLOCK_LIMIT.write_count.clone()),
-                    read_length: opts
-                        .read_length
-                        .unwrap_or(HELIUM_BLOCK_LIMIT.read_length.clone()),
-                    read_count: opts
-                        .read_count
-                        .unwrap_or(HELIUM_BLOCK_LIMIT.read_count.clone()),
-                    runtime: opts.runtime.unwrap_or(HELIUM_BLOCK_LIMIT.runtime.clone()),
-                },
-                None => HELIUM_BLOCK_LIMIT.clone(),
-            }
-        };
+        let block_limit = BLOCK_LIMIT_MAINNET.clone();
 
         Config {
             node,
@@ -851,6 +739,7 @@ impl Config {
             events_observers,
             connection_options,
             block_limit,
+            miner,
         }
     }
 
@@ -941,6 +830,29 @@ impl Config {
     pub fn is_node_event_driven(&self) -> bool {
         self.events_observers.len() > 0
     }
+
+    pub fn make_block_builder_settings(&self, attempt: u64) -> BlockBuilderSettings {
+        BlockBuilderSettings {
+            execution_cost: self.block_limit.clone(),
+            max_miner_time_ms: if attempt <= 1 {
+                // first attempt to mine a block -- do so right away
+                self.miner.first_attempt_time_ms
+            } else {
+                // second or later attempt to mine a block -- give it some time
+                self.miner.subsequent_attempt_time_ms
+            },
+            mempool_settings: MemPoolWalkSettings {
+                min_tx_fee: self.miner.min_tx_fee,
+                max_walk_time_ms: if attempt <= 1 {
+                    // first attempt to mine a block -- do so right away
+                    self.miner.first_attempt_time_ms
+                } else {
+                    // second or later attempt to mine a block -- give it some time
+                    self.miner.subsequent_attempt_time_ms
+                },
+            },
+        }
+    }
 }
 
 impl std::default::Default for Config {
@@ -964,6 +876,7 @@ impl std::default::Default for Config {
             events_observers: vec![],
             connection_options,
             block_limit,
+            miner: MinerConfig::default(),
         }
     }
 }
@@ -1042,7 +955,7 @@ impl BurnchainConfig {
         match self.mode.as_str() {
             "mainnet" => ("mainnet".to_string(), BitcoinNetworkType::Mainnet),
             "xenon" => ("testnet".to_string(), BitcoinNetworkType::Testnet),
-            "helium" | "neon" | "argon" | "krypton" => {
+            "helium" | "neon" | "argon" | "krypton" | "mocknet" => {
                 ("regtest".to_string(), BitcoinNetworkType::Regtest)
             }
             _ => panic!("Invalid bitcoin mode -- expected mainnet, testnet, or regtest"),
@@ -1215,6 +1128,23 @@ impl NodeConfig {
     }
 }
 
+#[derive(Clone, Debug, Default)]
+pub struct MinerConfig {
+    pub min_tx_fee: u64,
+    pub first_attempt_time_ms: u64,
+    pub subsequent_attempt_time_ms: u64,
+}
+
+impl MinerConfig {
+    pub fn default() -> MinerConfig {
+        MinerConfig {
+            min_tx_fee: 1,
+            first_attempt_time_ms: 1_000,
+            subsequent_attempt_time_ms: 60_000,
+        }
+    }
+}
+
 #[derive(Clone, Default, Deserialize)]
 pub struct ConnectionOptionsFile {
     pub inbox_maxlen: Option<usize>,
@@ -1237,7 +1167,7 @@ pub struct ConnectionOptionsFile {
     pub soft_max_clients_per_host: Option<u64>,
     pub max_sockets: Option<u64>,
     pub walk_interval: Option<u64>,
-    pub dns_timeout: Option<u128>,
+    pub dns_timeout: Option<u64>,
     pub max_inflight_blocks: Option<u64>,
     pub max_inflight_attachments: Option<u64>,
     pub read_only_call_limit_write_length: Option<u64>,
@@ -1256,15 +1186,6 @@ pub struct ConnectionOptionsFile {
     pub disable_block_download: Option<bool>,
     pub force_disconnect_interval: Option<u64>,
     pub antientropy_public: Option<bool>,
-}
-
-#[derive(Clone, Default, Deserialize)]
-pub struct BlockLimitFile {
-    pub write_length: Option<u64>,
-    pub read_length: Option<u64>,
-    pub write_count: Option<u64>,
-    pub read_count: Option<u64>,
-    pub runtime: Option<u64>,
 }
 
 #[derive(Clone, Deserialize, Default)]
@@ -1291,6 +1212,13 @@ pub struct NodeConfigFile {
 }
 
 #[derive(Clone, Deserialize, Default)]
+pub struct MinerConfigFile {
+    pub min_tx_fee: Option<u64>,
+    pub first_attempt_time_ms: Option<u64>,
+    pub subsequent_attempt_time_ms: Option<u64>,
+}
+
+#[derive(Clone, Deserialize, Default)]
 pub struct EventObserverConfigFile {
     pub endpoint: String,
     pub events_keys: Vec<String>,
@@ -1308,6 +1236,7 @@ pub enum EventKeyType {
     AssetEvent(AssetIdentifier),
     STXEvent,
     MemPoolTransactions,
+    Microblocks,
     AnyEvent,
     BurnchainBlocks,
 }
@@ -1328,6 +1257,10 @@ impl EventKeyType {
 
         if raw_key == "burn_blocks" {
             return Some(EventKeyType::BurnchainBlocks);
+        }
+
+        if raw_key == "microblocks" {
+            return Some(EventKeyType::Microblocks);
         }
 
         let comps: Vec<_> = raw_key.split("::").collect();

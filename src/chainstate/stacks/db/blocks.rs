@@ -22,70 +22,62 @@ use std::fs;
 use std::io;
 use std::io::prelude::*;
 use std::io::{Read, Seek, SeekFrom, Write};
+use std::path::{Path, PathBuf};
 
+use rand::thread_rng;
+use rand::Rng;
+use rand::RngCore;
 use rusqlite::Connection;
 use rusqlite::DatabaseName;
+use rusqlite::{Error as sqlite_error, OptionalExtension};
 
-use core::mempool::MAXIMUM_MEMPOOL_TX_CHAINING;
-use core::*;
-
+use crate::codec::MAX_MESSAGE_LEN;
+use chainstate::burn::db::sortdb::*;
 use chainstate::burn::operations::*;
-
+use chainstate::burn::BlockSnapshot;
 use chainstate::stacks::db::accounts::MinerReward;
 use chainstate::stacks::db::transactions::TransactionNonceMismatch;
 use chainstate::stacks::db::*;
 use chainstate::stacks::index::MarfTrieId;
 use chainstate::stacks::Error;
 use chainstate::stacks::*;
-
-use chainstate::burn::BlockSnapshot;
-
-use std::path::{Path, PathBuf};
-
+use chainstate::stacks::{
+    C32_ADDRESS_VERSION_MAINNET_MULTISIG, C32_ADDRESS_VERSION_MAINNET_SINGLESIG,
+    C32_ADDRESS_VERSION_TESTNET_MULTISIG, C32_ADDRESS_VERSION_TESTNET_SINGLESIG,
+};
+use clarity_vm::clarity::{ClarityBlockConnection, ClarityConnection, ClarityInstance};
+use core::mempool::MAXIMUM_MEMPOOL_TX_CHAINING;
+use core::*;
+use net::BlocksInvData;
+use net::Error as net_error;
+use util::db::u64_to_sql;
 use util::db::Error as db_error;
 use util::db::{
     query_count, query_int, query_row, query_row_columns, query_row_panic, query_rows,
     tx_busy_handler, DBConn, FromColumn, FromRow,
 };
-
-use util::db::u64_to_sql;
 use util::get_epoch_time_ms;
 use util::get_epoch_time_secs;
 use util::hash::to_hex;
-use util::strings::StacksString;
-
 use util::retry::BoundReader;
-
-use chainstate::burn::db::sortdb::*;
-
-use net::BlocksInvData;
-use net::Error as net_error;
-use net::MAX_MESSAGE_LEN;
-
+use util::strings::StacksString;
+pub use vm::analysis::errors::{CheckError, CheckErrors};
+use vm::analysis::run_analysis;
+use vm::ast::build_ast;
+use vm::contexts::AssetMap;
+use vm::contracts::Contract;
+use vm::costs::LimitedCostTracker;
+use vm::database::{BurnStateDB, ClarityDatabase, NULL_BURN_STATE_DB, NULL_HEADER_DB};
 use vm::types::{
     AssetIdentifier, PrincipalData, QualifiedContractIdentifier, SequenceData,
     StandardPrincipalData, TupleData, TypeSignature, Value,
 };
 
-use vm::contexts::AssetMap;
-
-use vm::analysis::run_analysis;
-use vm::ast::build_ast;
-
-use vm::clarity::{ClarityBlockConnection, ClarityConnection, ClarityInstance};
-
-pub use vm::analysis::errors::{CheckError, CheckErrors};
-
-use vm::database::{BurnStateDB, ClarityDatabase, NULL_BURN_STATE_DB, NULL_HEADER_DB};
-
-use vm::contracts::Contract;
-use vm::costs::LimitedCostTracker;
-
-use rand::thread_rng;
-use rand::Rng;
-use rand::RngCore;
-
-use rusqlite::{Error as sqlite_error, OptionalExtension};
+use crate::types::chainstate::{
+    StacksAddress, StacksBlockHeader, StacksBlockId, StacksMicroblockHeader,
+};
+use crate::{types, util};
+use types::chainstate::BurnchainHeaderHash;
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct StagingMicroblock {
@@ -128,8 +120,8 @@ pub struct StagingUserBurnSupport {
 
 #[derive(Debug)]
 pub enum MemPoolRejection {
-    SerializationFailure(net_error),
-    DeserializationFailure(net_error),
+    SerializationFailure(codec_error),
+    DeserializationFailure(codec_error),
     FailedToValidate(Error),
     FeeTooLow(u64, u64),
     BadNonces(TransactionNonceMismatch),
@@ -665,7 +657,7 @@ impl StacksChainState {
             })?;
 
         let mut bound_reader = BoundReader::from_reader(&mut fd, MAX_MESSAGE_LEN as u64);
-        let inst = T::consensus_deserialize(&mut bound_reader).map_err(Error::NetError)?;
+        let inst = T::consensus_deserialize(&mut bound_reader).map_err(Error::CodecError)?;
         Ok(inst)
     }
 
@@ -728,7 +720,7 @@ impl StacksChainState {
             &block_path
         );
         StacksChainState::atomic_file_store(&block_path, true, |ref mut fd| {
-            block.consensus_serialize(fd).map_err(Error::NetError)
+            block.consensus_serialize(fd).map_err(Error::CodecError)
         })
     }
 
@@ -1090,7 +1082,7 @@ impl StacksChainState {
 
                 match StacksBlock::consensus_deserialize(&mut &staging_block.block_data[..]) {
                     Ok(block) => Ok(Some(block)),
-                    Err(e) => Err(Error::NetError(e)),
+                    Err(e) => Err(Error::CodecError(e)),
                 }
             }
             None => Ok(None),
@@ -1566,8 +1558,8 @@ impl StacksChainState {
             block.block_hash(),
             parent_consensus_hash
         );
-        assert!(commit_burn < i64::max_value() as u64);
-        assert!(sortition_burn < i64::max_value() as u64);
+        assert!(commit_burn < i64::MAX as u64);
+        assert!(sortition_burn < i64::MAX as u64);
 
         let block_hash = block.block_hash();
         let index_block_hash =
@@ -1688,7 +1680,7 @@ impl StacksChainState {
         let mut microblock_bytes = vec![];
         microblock
             .consensus_serialize(&mut microblock_bytes)
-            .map_err(Error::NetError)?;
+            .map_err(Error::CodecError)?;
 
         let index_block_hash = StacksBlockHeader::make_index_block_hash(
             parent_consensus_hash,
@@ -1737,7 +1729,7 @@ impl StacksChainState {
         burn_supports: &Vec<UserBurnSupportOp>,
     ) -> Result<(), Error> {
         for burn_support in burn_supports.iter() {
-            assert!(burn_support.burn_fee < i64::max_value() as u64);
+            assert!(burn_support.burn_fee < i64::MAX as u64);
         }
 
         for burn_support in burn_supports.iter() {
@@ -3884,10 +3876,11 @@ impl StacksChainState {
         for microblock in microblocks.iter() {
             debug!("Process microblock {}", &microblock.block_hash());
             for tx in microblock.txs.iter() {
-                let (tx_fee, tx_receipt) =
+                let (tx_fee, mut tx_receipt) =
                     StacksChainState::process_transaction(clarity_tx, tx, false)
                         .map_err(|e| (e, microblock.block_hash()))?;
 
+                tx_receipt.microblock_header = Some(microblock.header.clone());
                 fees = fees.checked_add(tx_fee as u128).expect("Fee overflow");
                 burns = burns
                     .checked_add(tx_receipt.stx_burned as u128)
@@ -3955,6 +3948,7 @@ impl StacksChainState {
                             stx_burned: 0,
                             contract_analysis: None,
                             execution_cost,
+                            microblock_header: None,
                         };
 
                         all_receipts.push(receipt);
@@ -4008,6 +4002,7 @@ impl StacksChainState {
                                 stx_burned: 0,
                                 contract_analysis: None,
                                 execution_cost: ExecutionCost::zero(),
+                                microblock_header: None,
                             }),
                             Err(e) => {
                                 info!("TransferStx burn op processing error.";
@@ -4103,7 +4098,7 @@ impl StacksChainState {
         clarity_tx: &mut ClarityTx<'a>,
     ) -> Result<(u128, Vec<StacksTransactionEvent>), Error> {
         let mainnet = clarity_tx.config.mainnet;
-        let lockup_contract_id = boot::boot_code_id("lockup", mainnet);
+        let lockup_contract_id = util::boot::boot_code_id("lockup", mainnet);
         clarity_tx
             .connection()
             .as_transaction(|tx_connection| {
@@ -4240,6 +4235,9 @@ impl StacksChainState {
             block_execution_cost,
             matured_rewards,
             matured_rewards_info,
+            parent_burn_block_hash,
+            parent_burn_block_height,
+            parent_burn_block_timestamp,
         ) = {
             let (parent_consensus_hash, parent_block_hash) = if block.is_first_mined() {
                 // has to be the sentinal hashes if this block has no parent
@@ -4253,6 +4251,31 @@ impl StacksChainState {
                     parent_chain_tip.anchored_header.block_hash(),
                 )
             };
+
+            // get previous burn block stats
+            let (parent_burn_block_hash, parent_burn_block_height, parent_burn_block_timestamp) =
+                if block.is_first_mined() {
+                    (BurnchainHeaderHash([0; 32]), 0, 0)
+                } else {
+                    match SortitionDB::get_block_snapshot_consensus(
+                        burn_dbconn,
+                        &parent_consensus_hash,
+                    )? {
+                        Some(sn) => (
+                            sn.burn_header_hash,
+                            sn.block_height as u32,
+                            sn.burn_header_timestamp,
+                        ),
+                        None => {
+                            // shouldn't happen
+                            warn!(
+                                "CORRUPTION: block {}/{} does not correspond to a burn block",
+                                &parent_consensus_hash, &parent_block_hash
+                            );
+                            (BurnchainHeaderHash([0; 32]), 0, 0)
+                        }
+                    }
+                };
 
             let (last_microblock_hash, last_microblock_seq) = if microblocks.len() > 0 {
                 let _first_mblock_hash = microblocks[0].block_hash();
@@ -4589,6 +4612,9 @@ impl StacksChainState {
                 block_cost,
                 matured_rewards,
                 matured_rewards_info,
+                parent_burn_block_hash,
+                parent_burn_block_height,
+                parent_burn_block_timestamp,
             )
         };
 
@@ -4623,6 +4649,9 @@ impl StacksChainState {
             matured_rewards_info,
             parent_microblocks_cost: microblock_execution_cost,
             anchored_block_cost: block_execution_cost,
+            parent_burn_block_hash,
+            parent_burn_block_height,
+            parent_burn_block_timestamp,
         };
 
         Ok(epoch_receipt)
@@ -4703,7 +4732,7 @@ impl StacksChainState {
     fn extract_stacks_block(next_staging_block: &StagingBlock) -> Result<StacksBlock, Error> {
         let block = {
             StacksBlock::consensus_deserialize(&mut &next_staging_block.block_data[..])
-                .map_err(Error::NetError)?
+                .map_err(Error::CodecError)?
         };
 
         let block_hash = block.block_hash();
@@ -5494,28 +5523,31 @@ impl StacksChainState {
 
 #[cfg(test)]
 pub mod test {
-    use super::*;
-    use chainstate::stacks::db::test::*;
-    use chainstate::stacks::db::*;
-    use chainstate::stacks::miner::test::*;
-    use chainstate::stacks::test::*;
-    use chainstate::stacks::Error as chainstate_error;
-    use chainstate::stacks::*;
+    use std::fs;
+
+    use rand::thread_rng;
+    use rand::Rng;
 
     use burnchains::*;
     use chainstate::burn::db::sortdb::*;
     use chainstate::burn::*;
-    use std::fs;
+    use chainstate::stacks::db::test::*;
+    use chainstate::stacks::db::*;
+    use chainstate::stacks::miner::test::*;
+    use chainstate::stacks::miner::*;
+    use chainstate::stacks::test::*;
+    use chainstate::stacks::Error as chainstate_error;
+    use chainstate::stacks::*;
+    use core::mempool::*;
+    use net::test::*;
     use util::db::Error as db_error;
     use util::db::*;
     use util::hash::*;
     use util::retry::*;
 
-    use core::mempool::*;
-    use net::test::*;
+    use crate::types::chainstate::{BlockHeaderHash, StacksWorkScore};
 
-    use rand::thread_rng;
-    use rand::Rng;
+    use super::*;
 
     pub fn make_empty_coinbase_block(mblock_key: &StacksPrivateKey) -> StacksBlock {
         let privk = StacksPrivateKey::from_hex(
@@ -6505,7 +6537,7 @@ pub mod test {
                 &block.block_hash()
             ),
             0,
-            u16::max_value()
+            u16::MAX
         )
         .unwrap()
         .is_none());
@@ -6574,7 +6606,7 @@ pub mod test {
                     &block.block_hash()
                 ),
                 0,
-                u16::max_value()
+                u16::MAX
             )
             .unwrap()
             .unwrap(),
@@ -6673,7 +6705,7 @@ pub mod test {
                 &block.block_hash()
             ),
             0,
-            u16::max_value()
+            u16::MAX
         )
         .unwrap()
         .is_some());
@@ -6685,7 +6717,7 @@ pub mod test {
                     &block.block_hash()
                 ),
                 0,
-                u16::max_value()
+                u16::MAX
             )
             .unwrap()
             .unwrap(),
@@ -6729,7 +6761,7 @@ pub mod test {
                 &block.block_hash()
             ),
             0,
-            u16::max_value()
+            u16::MAX
         )
         .unwrap()
         .is_none());
@@ -6799,7 +6831,7 @@ pub mod test {
                     &block.block_hash()
                 ),
                 0,
-                u16::max_value()
+                u16::MAX
             )
             .unwrap()
             .unwrap(),
@@ -6935,7 +6967,7 @@ pub mod test {
                 &block.block_hash()
             ),
             0,
-            u16::max_value()
+            u16::MAX
         )
         .unwrap()
         .is_some());
@@ -6947,7 +6979,7 @@ pub mod test {
                     &block.block_hash()
                 ),
                 0,
-                u16::max_value()
+                u16::MAX
             )
             .unwrap()
             .unwrap(),
@@ -6991,7 +7023,7 @@ pub mod test {
                 &block.block_hash()
             ),
             0,
-            u16::max_value()
+            u16::MAX
         )
         .unwrap()
         .is_none());
@@ -7076,7 +7108,7 @@ pub mod test {
                 &block.block_hash()
             ),
             0,
-            u16::max_value()
+            u16::MAX
         )
         .unwrap()
         .is_none());
@@ -8253,7 +8285,7 @@ pub mod test {
                             &block.block_hash()
                         ),
                         0,
-                        u16::max_value()
+                        u16::MAX
                     )
                     .unwrap()
                     .unwrap()
@@ -8266,7 +8298,7 @@ pub mod test {
                     &chainstate.db(),
                     &StacksBlockHeader::make_index_block_hash(&consensus_hash, &block.block_hash()),
                     0,
-                    u16::max_value()
+                    u16::MAX
                 )
                 .unwrap()
                 .is_none());
@@ -8969,21 +9001,17 @@ pub mod test {
             for j in 0..(i + 1) {
                 assert!(
                     block_inv_all.has_ith_block(j as u16),
-                    format!(
-                        "Missing block {} from bitvec {}",
-                        j,
-                        to_hex(&block_inv_all.block_bitvec)
-                    )
+                    "Missing block {} from bitvec {}",
+                    j,
+                    to_hex(&block_inv_all.block_bitvec)
                 );
 
                 // microblocks not stored yet, so they should be marked absent
                 assert!(
                     !block_inv_all.has_ith_microblock_stream(j as u16),
-                    format!(
-                        "Have microblock {} from bitvec {}",
-                        j,
-                        to_hex(&block_inv_all.microblocks_bitvec)
-                    )
+                    "Have microblock {} from bitvec {}",
+                    j,
+                    to_hex(&block_inv_all.microblocks_bitvec)
                 );
             }
             for j in i + 1..blocks.len() {
@@ -9063,19 +9091,15 @@ pub mod test {
                 test_debug!("Test bit {} ({})", j, i);
                 assert!(
                     !block_inv_all.has_ith_block(j as u16),
-                    format!(
-                        "Have orphaned block {} from bitvec {}",
-                        j,
-                        to_hex(&block_inv_all.block_bitvec)
-                    )
+                    "Have orphaned block {} from bitvec {}",
+                    j,
+                    to_hex(&block_inv_all.block_bitvec)
                 );
                 assert!(
                     !block_inv_all.has_ith_microblock_stream(j as u16),
-                    format!(
-                        "Still have microblock {} from bitvec {}",
-                        j,
-                        to_hex(&block_inv_all.microblocks_bitvec)
-                    )
+                    "Still have microblock {} from bitvec {}",
+                    j,
+                    to_hex(&block_inv_all.microblocks_bitvec)
                 );
             }
             for j in (i + 1)..blocks.len() {
@@ -9154,7 +9178,7 @@ pub mod test {
                         vrf_proof,
                         Hash160([tenure_id as u8; 20]),
                         &coinbase_tx,
-                        ExecutionCost::max_value(),
+                        BlockBuilderSettings::max_value(),
                         None,
                     )
                     .unwrap();

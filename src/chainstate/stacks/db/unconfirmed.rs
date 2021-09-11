@@ -20,28 +20,53 @@
 use std::collections::{HashMap, HashSet};
 use std::fs;
 
-use core::*;
-
 use chainstate::stacks::db::accounts::*;
 use chainstate::stacks::db::blocks::*;
 use chainstate::stacks::db::*;
 use chainstate::stacks::events::*;
 use chainstate::stacks::Error;
 use chainstate::stacks::*;
-
+use clarity_vm::clarity::{ClarityInstance, Error as clarity_error};
+use core::*;
 use net::Error as net_error;
 use util::db::Error as db_error;
-
-use vm::clarity::{ClarityInstance, Error as clarity_error};
-use vm::database::marf::MarfedKV;
+use vm::costs::ExecutionCost;
 use vm::database::BurnStateDB;
 use vm::database::HeadersDB;
 use vm::database::NULL_BURN_STATE_DB;
 use vm::database::NULL_HEADER_DB;
 
-use vm::costs::ExecutionCost;
+use crate::clarity_vm::database::marf::MarfedKV;
+use crate::types::chainstate::{StacksBlockHeader, StacksBlockId, StacksMicroblockHeader};
+use chainstate::burn::db::sortdb::SortitionDB;
+use types::chainstate::BurnchainHeaderHash;
 
 pub type UnconfirmedTxMap = HashMap<Txid, (StacksTransaction, BlockHeaderHash, u16)>;
+
+pub struct ProcessedUnconfirmedState {
+    pub total_burns: u128,
+    pub total_fees: u128,
+    // each element of this vector is a tuple, where each tuple contains a microblock
+    // sequence number, microblock header, and a vector of transaction receipts
+    // for that microblock
+    pub receipts: Vec<(u16, StacksMicroblockHeader, Vec<StacksTransactionReceipt>)>,
+    pub burn_block_hash: BurnchainHeaderHash,
+    pub burn_block_height: u32,
+    pub burn_block_timestamp: u64,
+}
+
+impl Default for ProcessedUnconfirmedState {
+    fn default() -> Self {
+        ProcessedUnconfirmedState {
+            total_burns: 0,
+            total_fees: 0,
+            receipts: vec![],
+            burn_block_hash: BurnchainHeaderHash([0; 32]),
+            burn_block_height: 0,
+            burn_block_timestamp: 0,
+        }
+    }
+}
 
 pub struct UnconfirmedState {
     pub confirmed_chain_tip: StacksBlockId,
@@ -138,10 +163,10 @@ impl UnconfirmedState {
         chainstate: &StacksChainState,
         burn_dbconn: &dyn BurnStateDB,
         mblocks: Vec<StacksMicroblock>,
-    ) -> Result<(u128, u128, Vec<StacksTransactionReceipt>), Error> {
-        if self.last_mblock_seq == u16::max_value() {
+    ) -> Result<ProcessedUnconfirmedState, Error> {
+        if self.last_mblock_seq == u16::MAX {
             // drop them -- nothing to do
-            return Ok((0, 0, vec![]));
+            return Ok(Default::default());
         }
 
         debug!(
@@ -149,6 +174,17 @@ impl UnconfirmedState {
             &self.confirmed_chain_tip,
             mblocks.len()
         );
+
+        let headers_db = chainstate.db();
+        let burn_block_hash = headers_db
+            .get_burn_header_hash_for_block(&self.confirmed_chain_tip)
+            .expect("BUG: unable to get burn block hash based on chain tip");
+        let burn_block_height = headers_db
+            .get_burn_block_height_for_block(&self.confirmed_chain_tip)
+            .expect("BUG: unable to get burn block height based on chain tip");
+        let burn_block_timestamp = headers_db
+            .get_burn_block_time_for_block(&self.confirmed_chain_tip)
+            .expect("BUG: unable to get burn block timestamp based on chain tip");
 
         let mut last_mblock = self.last_mblock.take();
         let mut last_mblock_seq = self.last_mblock_seq;
@@ -195,7 +231,7 @@ impl UnconfirmedState {
                     &mblock_hash, mblock.header.sequence
                 );
 
-                let (stx_fees, stx_burns, mut receipts) =
+                let (stx_fees, stx_burns, receipts) =
                     match StacksChainState::process_microblocks_transactions(
                         &mut clarity_tx,
                         &vec![mblock.clone()],
@@ -213,7 +249,7 @@ impl UnconfirmedState {
                 total_fees += stx_fees;
                 total_burns += stx_burns;
                 num_new_mblocks += 1;
-                all_receipts.append(&mut receipts);
+                all_receipts.push((seq, mblock.header, receipts));
 
                 last_mblock = Some(mblock_header);
                 last_mblock_seq = seq;
@@ -229,10 +265,7 @@ impl UnconfirmedState {
                 };
 
                 for tx in &mblock.txs {
-                    mined_txs.insert(
-                        tx.txid(),
-                        (tx.clone(), mblock.block_hash(), mblock.header.sequence),
-                    );
+                    mined_txs.insert(tx.txid(), (tx.clone(), mblock_hash, seq));
                 }
             }
 
@@ -257,7 +290,14 @@ impl UnconfirmedState {
             self.bytes_so_far = 0;
         }
 
-        Ok((total_fees, total_burns, all_receipts))
+        Ok(ProcessedUnconfirmedState {
+            total_fees,
+            total_burns,
+            receipts: all_receipts,
+            burn_block_hash,
+            burn_block_height,
+            burn_block_timestamp,
+        })
     }
 
     /// Load up the Stacks microblock stream to process, composed of only the new microblocks
@@ -277,29 +317,30 @@ impl UnconfirmedState {
             &chainstate.db(),
             &StacksBlockHeader::make_index_block_hash(&consensus_hash, &anchored_block_hash),
             0,
-            u16::max_value(),
+            u16::MAX,
         )
     }
 
     /// Update the view of the current confiremd chain tip's unconfirmed microblock state
+    /// Returns ProcessedUnconfirmedState for the microblocks newly added to the unconfirmed state
     pub fn refresh(
         &mut self,
         chainstate: &StacksChainState,
         burn_dbconn: &dyn BurnStateDB,
-    ) -> Result<(u128, u128, Vec<StacksTransactionReceipt>), Error> {
+    ) -> Result<ProcessedUnconfirmedState, Error> {
         assert!(
             !self.readonly,
             "BUG: code tried to write unconfirmed state to a read-only instance"
         );
 
-        if self.last_mblock_seq == u16::max_value() {
+        if self.last_mblock_seq == u16::MAX {
             // no-op
-            return Ok((0, 0, vec![]));
+            return Ok(Default::default());
         }
 
         match self.load_child_microblocks(chainstate)? {
             Some(microblocks) => self.append_microblocks(chainstate, burn_dbconn, microblocks),
-            None => Ok((0, 0, vec![])),
+            None => Ok(Default::default()),
         }
     }
 
@@ -322,6 +363,11 @@ impl UnconfirmedState {
     /// Does the unconfirmed state represent any data?
     fn has_data(&self) -> bool {
         self.last_mblock.is_some()
+    }
+
+    /// Does the unconfirmed microblock state represent any transactions?
+    pub fn num_mined_txs(&self) -> usize {
+        self.mined_txs.len()
     }
 
     /// Get information about an unconfirmed transaction
@@ -377,15 +423,15 @@ impl StacksChainState {
         &self,
         burn_dbconn: &dyn BurnStateDB,
         anchored_block_id: StacksBlockId,
-    ) -> Result<(UnconfirmedState, u128, u128, Vec<StacksTransactionReceipt>), Error> {
+    ) -> Result<(UnconfirmedState, ProcessedUnconfirmedState), Error> {
         debug!("Make new unconfirmed state off of {}", &anchored_block_id);
         let mut unconfirmed_state = UnconfirmedState::new(self, anchored_block_id)?;
-        let (fees, burns, receipts) = unconfirmed_state.refresh(self, burn_dbconn)?;
+        let processed_unconfirmed_state = unconfirmed_state.refresh(self, burn_dbconn)?;
         debug!(
             "Made new unconfirmed state off of {} (at {})",
             &anchored_block_id, &unconfirmed_state.unconfirmed_chain_tip
         );
-        Ok((unconfirmed_state, fees, burns, receipts))
+        Ok((unconfirmed_state, processed_unconfirmed_state))
     }
 
     /// Reload the unconfirmed view from a new chain tip.
@@ -397,7 +443,7 @@ impl StacksChainState {
         &mut self,
         burn_dbconn: &dyn BurnStateDB,
         canonical_tip: StacksBlockId,
-    ) -> Result<(u128, u128, Vec<StacksTransactionReceipt>), Error> {
+    ) -> Result<ProcessedUnconfirmedState, Error> {
         debug!("Reload unconfirmed state off of {}", &canonical_tip);
 
         let unconfirmed_state = self.unconfirmed_state.take();
@@ -429,7 +475,7 @@ impl StacksChainState {
             self.drop_unconfirmed_state(unconfirmed_state);
         }
 
-        let (new_unconfirmed_state, fees, burns, receipts) =
+        let (new_unconfirmed_state, processed_unconfirmed_state) =
             self.make_unconfirmed_state(burn_dbconn, canonical_tip)?;
 
         debug!(
@@ -438,19 +484,19 @@ impl StacksChainState {
         );
 
         self.unconfirmed_state = Some(new_unconfirmed_state);
-        Ok((fees, burns, receipts))
+        Ok(processed_unconfirmed_state)
     }
 
     /// Refresh the current unconfirmed chain state
     pub fn refresh_unconfirmed_state(
         &mut self,
         burn_dbconn: &dyn BurnStateDB,
-    ) -> Result<(u128, u128, Vec<StacksTransactionReceipt>), Error> {
+    ) -> Result<ProcessedUnconfirmedState, Error> {
         let mut unconfirmed_state = self.unconfirmed_state.take();
         let res = if let Some(ref mut unconfirmed_state) = unconfirmed_state {
             if !unconfirmed_state.is_readable() {
                 warn!("Unconfirmed state is not readable; it will soon be refreshed");
-                return Ok((0, 0, vec![]));
+                return Ok(Default::default());
             }
 
             debug!(
@@ -467,7 +513,7 @@ impl StacksChainState {
             res
         } else {
             warn!("No unconfirmed state instantiated");
-            Ok((0, 0, vec![]))
+            Ok(Default::default())
         };
         self.unconfirmed_state = unconfirmed_state;
         res
@@ -501,28 +547,24 @@ impl StacksChainState {
 
 #[cfg(test)]
 mod test {
-    use super::*;
-
     use std::fs;
 
     use burnchains::PublicKey;
-
+    use chainstate::burn::db::sortdb::*;
+    use chainstate::burn::db::*;
+    use chainstate::stacks::db::test::*;
+    use chainstate::stacks::db::*;
     use chainstate::stacks::index::marf::*;
     use chainstate::stacks::index::node::*;
     use chainstate::stacks::index::*;
-
-    use chainstate::stacks::db::test::*;
-    use chainstate::stacks::db::*;
+    use chainstate::stacks::miner::test::make_coinbase;
     use chainstate::stacks::miner::*;
+    use chainstate::stacks::C32_ADDRESS_VERSION_TESTNET_SINGLESIG;
     use chainstate::stacks::*;
-
+    use core::mempool::*;
     use net::test::*;
 
-    use chainstate::burn::db::sortdb::*;
-    use chainstate::burn::db::*;
-
-    use chainstate::stacks::miner::test::make_coinbase;
-    use core::mempool::*;
+    use super::*;
 
     #[test]
     fn test_unconfirmed_refresh_one_microblock_stx_transfer() {
@@ -657,6 +699,7 @@ mod test {
                         consensus_hash.clone(),
                         peer.chainstate(),
                         &sort_iconn,
+                        BlockBuilderSettings::max_value(),
                     )
                     .unwrap();
 
@@ -885,6 +928,7 @@ mod test {
                     consensus_hash.clone(),
                     peer.chainstate(),
                     &sort_iconn,
+                    BlockBuilderSettings::max_value(),
                 )
                 .unwrap();
                 let mut microblocks = vec![];

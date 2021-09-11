@@ -42,15 +42,17 @@ use vm::types::{
 };
 use vm::{eval, is_reserved};
 
-use chainstate::burn::{BlockHeaderHash, VRFSeed};
 use chainstate::stacks::db::StacksChainState;
 use chainstate::stacks::events::*;
 use chainstate::stacks::Error as ChainstateError;
-use chainstate::stacks::StacksBlockId;
-use chainstate::stacks::StacksMicroblockHeader;
+
+use crate::types::chainstate::StacksBlockId;
+use crate::types::chainstate::StacksMicroblockHeader;
 
 use serde::Serialize;
 use vm::costs::cost_functions::ClarityCostFunction;
+
+use vm::coverage::CoverageReporter;
 
 pub const MAX_CONTEXT_DEPTH: u16 = 256;
 
@@ -91,6 +93,88 @@ pub struct AssetMap {
     asset_map: HashMap<PrincipalData, HashMap<AssetIdentifier, Vec<Value>>>,
 }
 
+impl AssetMap {
+    pub fn to_json(&self) -> serde_json::Value {
+        let stx: serde_json::map::Map<_, _> = self
+            .stx_map
+            .iter()
+            .map(|(principal, amount)| {
+                (
+                    format!("{}", principal),
+                    serde_json::value::Value::String(format!("{}", amount)),
+                )
+            })
+            .collect();
+
+        let burns: serde_json::map::Map<_, _> = self
+            .burn_map
+            .iter()
+            .map(|(principal, amount)| {
+                (
+                    format!("{}", principal),
+                    serde_json::value::Value::String(format!("{}", amount)),
+                )
+            })
+            .collect();
+
+        let tokens: serde_json::map::Map<_, _> = self
+            .token_map
+            .iter()
+            .map(|(principal, token_map)| {
+                let token_json: serde_json::map::Map<_, _> = token_map
+                    .iter()
+                    .map(|(asset_id, amount)| {
+                        (
+                            format!("{}", asset_id),
+                            serde_json::value::Value::String(format!("{}", amount)),
+                        )
+                    })
+                    .collect();
+
+                (
+                    format!("{}", principal),
+                    serde_json::value::Value::Object(token_json),
+                )
+            })
+            .collect();
+
+        let assets: serde_json::map::Map<_, _> = self
+            .asset_map
+            .iter()
+            .map(|(principal, nft_map)| {
+                let nft_json: serde_json::map::Map<_, _> = nft_map
+                    .iter()
+                    .map(|(asset_id, nft_values)| {
+                        let nft_array = nft_values
+                            .iter()
+                            .map(|nft_value| {
+                                serde_json::value::Value::String(format!("{}", nft_value))
+                            })
+                            .collect();
+
+                        (
+                            format!("{}", asset_id),
+                            serde_json::value::Value::Array(nft_array),
+                        )
+                    })
+                    .collect();
+
+                (
+                    format!("{}", principal),
+                    serde_json::value::Value::Object(nft_json),
+                )
+            })
+            .collect();
+
+        json!({
+            "stx": stx,
+            "burns": burns,
+            "tokens": tokens,
+            "assets": assets
+        })
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct EventBatch {
     pub events: Vec<StacksTransactionEvent>,
@@ -109,6 +193,7 @@ pub struct GlobalContext<'a> {
     read_only: Vec<bool>,
     pub cost_track: LimitedCostTracker,
     pub mainnet: bool,
+    pub coverage_reporting: Option<CoverageReporter>,
 }
 
 #[derive(Serialize, Deserialize, Clone)]
@@ -463,6 +548,14 @@ impl<'a> OwnedEnvironment<'a> {
         }
     }
 
+    pub fn set_coverage_reporter(&mut self, reporter: CoverageReporter) {
+        self.context.coverage_reporting = Some(reporter)
+    }
+
+    pub fn take_coverage_reporter(&mut self) -> Option<CoverageReporter> {
+        self.context.coverage_reporting.take()
+    }
+
     pub fn new_free(mainnet: bool, database: ClarityDatabase<'a>) -> OwnedEnvironment<'a> {
         OwnedEnvironment {
             context: GlobalContext::new(mainnet, database, LimitedCostTracker::new_free()),
@@ -638,6 +731,10 @@ impl<'a> OwnedEnvironment<'a> {
         let event_batch = event_batch.ok_or(InterpreterError::FailedToConstructEventBatch)?;
 
         Ok((asset_map, event_batch))
+    }
+
+    pub fn get_cost_total(&self) -> ExecutionCost {
+        self.context.cost_track.get_total()
     }
 
     /// Destroys this environment, returning ownership of its database reference.
@@ -1263,6 +1360,7 @@ impl<'a> GlobalContext<'a> {
             asset_maps: Vec::new(),
             event_batches: Vec::new(),
             mainnet,
+            coverage_reporting: None,
         }
     }
 
@@ -1613,8 +1711,7 @@ mod test {
         let mut am2 = AssetMap::new();
 
         am1.add_token_transfer(&p1, t1.clone(), 1).unwrap();
-        am1.add_token_transfer(&p2, t1.clone(), u128::max_value())
-            .unwrap();
+        am1.add_token_transfer(&p2, t1.clone(), u128::MAX).unwrap();
         am2.add_token_transfer(&p1, t1.clone(), 1).unwrap();
         am2.add_token_transfer(&p2, t1.clone(), 1).unwrap();
 
@@ -1622,7 +1719,7 @@ mod test {
 
         let table = am1.to_table();
 
-        assert_eq!(table[&p2][&t1], AssetMapEntry::Token(u128::max_value()));
+        assert_eq!(table[&p2][&t1], AssetMapEntry::Token(u128::MAX));
         assert_eq!(table[&p1][&t1], AssetMapEntry::Token(1));
     }
 

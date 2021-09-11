@@ -14,25 +14,22 @@
 // You should have received a copy of the GNU General Public License
 // along with this program.  If not, see <http://www.gnu.org/licenses/>.
 
-pub mod constants;
-pub mod cost_functions;
+use std::collections::{BTreeMap, HashMap};
+use std::convert::{TryFrom, TryInto};
+use std::{cmp, fmt};
 
 use regex::internal::Exec;
 use rusqlite::types::{FromSql, FromSqlResult, ToSql, ToSqlOutput, ValueRef};
 use serde::{Deserialize, Serialize};
-use std::convert::{TryFrom, TryInto};
-use std::{cmp, fmt};
 
-use std::collections::{BTreeMap, HashMap};
-
-use chainstate::stacks::boot::boot_code_id;
-
+use crate::util::boot::boot_code_id;
 use vm::ast::ContractAST;
 use vm::contexts::{ContractContext, Environment, GlobalContext, OwnedEnvironment};
 use vm::costs::cost_functions::ClarityCostFunction;
-use vm::database::{marf::NullBackingStore, ClarityDatabase, MemoryBackingStore};
+use vm::database::{clarity_store::NullBackingStore, ClarityDatabase};
 use vm::errors::{Error, InterpreterResult};
 use vm::types::signatures::FunctionType::Fixed;
+use vm::types::signatures::{FunctionSignature, TupleTypeSignature};
 use vm::types::Value::UInt;
 use vm::types::{
     FunctionArg, FunctionType, PrincipalData, QualifiedContractIdentifier, TupleData,
@@ -40,7 +37,8 @@ use vm::types::{
 };
 use vm::{ast, eval_all, ClarityName, SymbolicExpression, Value};
 
-use vm::types::signatures::{FunctionSignature, TupleTypeSignature};
+pub mod constants;
+pub mod cost_functions;
 
 type Result<T> = std::result::Result<T, CostErrors>;
 
@@ -1001,11 +999,11 @@ impl ExecutionCost {
 
     pub fn max_value() -> ExecutionCost {
         Self {
-            runtime: u64::max_value(),
-            write_length: u64::max_value(),
-            read_count: u64::max_value(),
-            write_count: u64::max_value(),
-            read_length: u64::max_value(),
+            runtime: u64::MAX,
+            write_length: u64::MAX,
+            read_count: u64::MAX,
+            write_count: u64::MAX,
+            read_length: u64::MAX,
         }
     }
 
@@ -1089,14 +1087,8 @@ mod unit_tests {
 
     #[test]
     fn test_simple_overflows() {
-        assert_eq!(
-            u64::max_value().cost_overflow_add(1),
-            Err(CostErrors::CostOverflow)
-        );
-        assert_eq!(
-            u64::max_value().cost_overflow_mul(2),
-            Err(CostErrors::CostOverflow)
-        );
+        assert_eq!(u64::MAX.cost_overflow_add(1), Err(CostErrors::CostOverflow));
+        assert_eq!(u64::MAX.cost_overflow_mul(2), Err(CostErrors::CostOverflow));
     }
 
     #[test]
@@ -1119,7 +1111,7 @@ mod unit_tests {
             64,
             128,
             2_u64.pow(63),
-            u64::max_value(),
+            u64::MAX,
         ];
         let expected = [0, 1, 2, 3, 4, 5, 5, 6, 6, 6, 7, 63, 64];
         for (input, expected) in inputs.iter().zip(expected.iter()) {

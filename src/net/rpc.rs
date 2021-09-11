@@ -17,13 +17,34 @@
  along with Blockstack. If not, see <http://www.gnu.org/licenses/>.
 */
 
+use std::collections::HashMap;
+use std::collections::HashSet;
+use std::collections::VecDeque;
 use std::io;
 use std::io::prelude::*;
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::net::SocketAddr;
 use std::{convert::TryFrom, fmt};
 
+use rand::prelude::*;
+use rand::thread_rng;
+use rusqlite::{DatabaseName, NO_PARAMS};
+
+use crate::codec::StacksMessageCodec;
+use burnchains::Burnchain;
+use burnchains::BurnchainView;
+use burnchains::*;
+use chainstate::burn::db::sortdb::SortitionDB;
+use chainstate::burn::ConsensusHash;
+use chainstate::stacks::db::blocks::CheckError;
+use chainstate::stacks::db::{
+    blocks::MINIMUM_TX_FEE_RATE_PER_BYTE, BlockStreamData, StacksChainState,
+};
+use chainstate::stacks::Error as chain_error;
+use chainstate::stacks::*;
+use clarity_vm::clarity::ClarityConnection;
 use core::mempool::*;
+use monitoring;
 use net::atlas::{AtlasDB, Attachment, MAX_ATTACHMENT_INV_PAGES_PER_REQUEST};
 use net::connection::ConnectionHttp;
 use net::connection::ConnectionOptions;
@@ -47,7 +68,6 @@ use net::PeerHost;
 use net::ProtocolFamily;
 use net::StacksHttp;
 use net::StacksHttpMessage;
-use net::StacksMessageCodec;
 use net::StacksMessageType;
 use net::UnconfirmedTransactionResponse;
 use net::UnconfirmedTransactionStatus;
@@ -61,54 +81,35 @@ use net::{
 use net::{BlocksData, GetIsTraitImplementedResponse};
 use net::{RPCNeighbor, RPCNeighborsInfo};
 use net::{RPCPeerInfoData, RPCPoxInfoData};
-use std::collections::HashMap;
-use std::collections::HashSet;
-use std::collections::VecDeque;
-
-use burnchains::Burnchain;
-use burnchains::BurnchainHeaderHash;
-use burnchains::BurnchainView;
-
-use burnchains::*;
-use chainstate::burn::db::sortdb::SortitionDB;
-use chainstate::burn::BlockHeaderHash;
-use chainstate::burn::ConsensusHash;
-use chainstate::stacks::db::{
-    blocks::MINIMUM_TX_FEE_RATE_PER_BYTE, BlockStreamData, StacksChainState,
-};
-use chainstate::stacks::Error as chain_error;
-use chainstate::stacks::*;
-use monitoring;
-
-use rusqlite::{DatabaseName, NO_PARAMS};
-
 use util::db::DBConn;
 use util::db::Error as db_error;
 use util::get_epoch_time_secs;
 use util::hash::Hash160;
 use util::hash::{hex_bytes, to_hex};
-
-use crate::{
-    chainstate::burn::operations::leader_block_commit::OUTPUTS_PER_COMMIT, util::hash::Sha256Sum,
-    version_string,
-};
-
+use vm::database::clarity_store::make_contract_hash_key;
+use vm::types::TraitIdentifier;
 use vm::{
-    clarity::ClarityConnection,
+    analysis::errors::CheckErrors,
     costs::{ExecutionCost, LimitedCostTracker},
     database::{
-        marf::ContractCommitment, ClarityDatabase, ClaritySerializable, MarfedKV, STXBalance,
+        clarity_store::ContractCommitment, ClarityDatabase, ClaritySerializable, STXBalance,
     },
     errors::Error as ClarityRuntimeError,
+    errors::Error::Unchecked,
     errors::InterpreterError,
     types::{PrincipalData, QualifiedContractIdentifier, StandardPrincipalData},
     ClarityName, ContractName, SymbolicExpression, Value,
 };
 
-use chainstate::stacks::db::blocks::CheckError;
-use rand::prelude::*;
-use rand::thread_rng;
-use vm::types::TraitIdentifier;
+use crate::clarity_vm::database::marf::MarfedKV;
+use crate::types::chainstate::BlockHeaderHash;
+use crate::types::chainstate::{
+    BurnchainHeaderHash, StacksAddress, StacksBlockHeader, StacksBlockId,
+};
+use crate::{
+    chainstate::burn::operations::leader_block_commit::OUTPUTS_PER_COMMIT, types, util,
+    util::hash::Sha256Sum, version_string,
+};
 
 use super::{RPCPoxCurrentCycleInfo, RPCPoxNextCycleInfo};
 
@@ -122,14 +123,12 @@ pub struct RPCHandlerArgs<'a> {
 }
 
 pub struct ConversationHttp {
-    network_id: u32,
     connection: ConnectionHttp,
     conn_id: usize,
     timeout: u64,
     peer_host: PeerHost,
     outbound_url: Option<UrlString>,
     peer_addr: SocketAddr,
-    burnchain: Burnchain,
     keep_alive: bool,
     total_request_count: u64,     // number of messages taken from the inbox
     total_reply_count: u64,       // number of messages responsed to
@@ -173,40 +172,21 @@ impl fmt::Debug for ConversationHttp {
 }
 
 impl RPCPeerInfoData {
-    pub fn from_db(
-        burnchain: &Burnchain,
-        sortdb: &SortitionDB,
+    pub fn from_network(
+        network: &PeerNetwork,
         chainstate: &StacksChainState,
-        peerdb: &PeerDB,
         exit_at_block_height: &Option<&u64>,
         genesis_chainstate_hash: &Sha256Sum,
-    ) -> Result<RPCPeerInfoData, net_error> {
-        let burnchain_tip = SortitionDB::get_canonical_burn_chain_tip(sortdb.conn())?;
-        let local_peer = PeerDB::get_local_peer(peerdb.conn())?;
-        let stable_burnchain_tip = {
-            let ic = sortdb.index_conn();
-            let stable_height =
-                if burnchain_tip.block_height < burnchain.stable_confirmations as u64 {
-                    0
-                } else {
-                    burnchain_tip.block_height - (burnchain.stable_confirmations as u64)
-                };
-            SortitionDB::get_ancestor_snapshot(&ic, stable_height, &burnchain_tip.sortition_id)?
-                .ok_or_else(|| net_error::DBError(db_error::NotFoundError))?
-        };
-
+    ) -> RPCPeerInfoData {
         let server_version = version_string(
             "stacks-node",
             option_env!("STACKS_NODE_VERSION")
                 .or(option_env!("CARGO_PKG_VERSION"))
                 .unwrap_or("0.0.0.0"),
         );
-        let stacks_tip_consensus_hash = burnchain_tip.canonical_stacks_tip_consensus_hash;
-        let stacks_tip = burnchain_tip.canonical_stacks_tip_hash;
-        let stacks_tip_height = burnchain_tip.canonical_stacks_tip_height;
         let (unconfirmed_tip, unconfirmed_seq) = match chainstate.unconfirmed_state {
             Some(ref unconfirmed) => {
-                if unconfirmed.is_readable() {
+                if unconfirmed.num_mined_txs() > 0 {
                     (
                         unconfirmed.unconfirmed_chain_tip.clone(),
                         unconfirmed.last_mblock_seq,
@@ -218,23 +198,26 @@ impl RPCPeerInfoData {
             None => (StacksBlockId([0x00; 32]), 0),
         };
 
-        Ok(RPCPeerInfoData {
-            peer_version: burnchain.peer_version,
-            pox_consensus: burnchain_tip.consensus_hash,
-            burn_block_height: burnchain_tip.block_height,
-            stable_pox_consensus: stable_burnchain_tip.consensus_hash,
-            stable_burn_block_height: stable_burnchain_tip.block_height,
+        RPCPeerInfoData {
+            peer_version: network.burnchain.peer_version,
+            pox_consensus: network.burnchain_tip.consensus_hash.clone(),
+            burn_block_height: network.chain_view.burn_block_height,
+            stable_pox_consensus: network.chain_view_stable_consensus_hash.clone(),
+            stable_burn_block_height: network.chain_view.burn_stable_block_height,
             server_version,
-            network_id: local_peer.network_id,
-            parent_network_id: local_peer.parent_network_id,
-            stacks_tip_height,
-            stacks_tip,
-            stacks_tip_consensus_hash: stacks_tip_consensus_hash.to_hex(),
+            network_id: network.local_peer.network_id,
+            parent_network_id: network.local_peer.parent_network_id,
+            stacks_tip_height: network.burnchain_tip.canonical_stacks_tip_height,
+            stacks_tip: network.burnchain_tip.canonical_stacks_tip_hash.clone(),
+            stacks_tip_consensus_hash: network
+                .burnchain_tip
+                .canonical_stacks_tip_consensus_hash
+                .clone(),
             unanchored_tip: unconfirmed_tip,
             unanchored_seq: unconfirmed_seq,
             exit_at_block_height: exit_at_block_height.cloned(),
             genesis_chainstate_hash: genesis_chainstate_hash.clone(),
-        })
+        }
     }
 }
 
@@ -246,7 +229,7 @@ impl RPCPoxInfoData {
         burnchain: &Burnchain,
     ) -> Result<RPCPoxInfoData, net_error> {
         let mainnet = chainstate.mainnet;
-        let contract_identifier = boot::boot_code_id("pox", mainnet);
+        let contract_identifier = util::boot::boot_code_id("pox", mainnet);
         let function = "get-pox-info";
         let cost_track = LimitedCostTracker::new_free();
         let sender = PrincipalData::Standard(StandardPrincipalData::transient());
@@ -379,7 +362,7 @@ impl RPCPoxInfoData {
         let cur_cycle_pox_active = sortdb.is_pox_active(burnchain, &burnchain_tip)?;
 
         Ok(RPCPoxInfoData {
-            contract_id: boot::boot_code_id("pox", chainstate.mainnet).to_string(),
+            contract_id: util::boot::boot_code_id("pox", chainstate.mainnet).to_string(),
             pox_activation_threshold_ustx,
             first_burnchain_block_height,
             prepare_phase_block_length: prepare_cycle_length,
@@ -472,18 +455,15 @@ impl RPCNeighborsInfo {
 
 impl ConversationHttp {
     pub fn new(
-        network_id: u32,
-        burnchain: &Burnchain,
         peer_addr: SocketAddr,
         outbound_url: Option<UrlString>,
         peer_host: PeerHost,
         conn_opts: &ConnectionOptions,
         conn_id: usize,
     ) -> ConversationHttp {
-        let mut stacks_http = StacksHttp::new();
+        let mut stacks_http = StacksHttp::new(peer_addr.clone());
         stacks_http.maximum_call_argument_size = conn_opts.maximum_call_argument_size;
         ConversationHttp {
-            network_id: network_id,
             connection: ConnectionHttp::new(stacks_http, conn_opts, None),
             conn_id: conn_id,
             timeout: conn_opts.timeout,
@@ -491,7 +471,6 @@ impl ConversationHttp {
             peer_addr: peer_addr,
             outbound_url: outbound_url,
             peer_host: peer_host,
-            burnchain: burnchain.clone(),
             pending_request: None,
             pending_response: None,
             pending_error_response: None,
@@ -606,36 +585,20 @@ impl ConversationHttp {
         http: &mut StacksHttp,
         fd: &mut W,
         req: &HttpRequestType,
-        burnchain: &Burnchain,
-        sortdb: &SortitionDB,
+        network: &PeerNetwork,
         chainstate: &StacksChainState,
-        peerdb: &PeerDB,
         handler_args: &RPCHandlerArgs,
     ) -> Result<(), net_error> {
         let response_metadata = HttpResponseMetadata::from(req);
-        match RPCPeerInfoData::from_db(
-            burnchain,
-            sortdb,
+        let pi = RPCPeerInfoData::from_network(
+            network,
             chainstate,
-            peerdb,
             &handler_args.exit_at_block_height,
             &handler_args.genesis_chainstate_hash,
-        ) {
-            Ok(pi) => {
-                let response = HttpResponseType::PeerInfo(response_metadata, pi);
-                // timer.observe_duration();
-                response.send(http, fd)
-            }
-            Err(e) => {
-                warn!("Failed to get peer info {:?}: {:?}", req, &e);
-                let response = HttpResponseType::ServerError(
-                    response_metadata,
-                    "Failed to query peer info".to_string(),
-                );
-                // timer.observe_duration();
-                response.send(http, fd)
-            }
-        }
+        );
+        let response = HttpResponseType::PeerInfo(response_metadata, pi);
+        // timer.observe_duration();
+        response.send(http, fd)
     }
 
     /// Handle a GET pox info.
@@ -771,13 +734,15 @@ impl ConversationHttp {
         http: &mut StacksHttp,
         fd: &mut W,
         req: &HttpRequestType,
-        network_id: u32,
-        chain_view: &BurnchainView,
-        peers: &PeerMap,
-        peerdb: &PeerDB,
+        network: &PeerNetwork,
     ) -> Result<(), net_error> {
         let response_metadata = HttpResponseMetadata::from(req);
-        let neighbor_data = RPCNeighborsInfo::from_p2p(network_id, peers, chain_view, peerdb)?;
+        let neighbor_data = RPCNeighborsInfo::from_p2p(
+            network.local_peer.network_id,
+            &network.peers,
+            &network.chain_view,
+            &network.peerdb,
+        )?;
         let response = HttpResponseType::Neighbors(response_metadata, neighbor_data);
         response.send(http, fd)
     }
@@ -1201,22 +1166,28 @@ impl ConversationHttp {
             .map(|x| SymbolicExpression::atom_value(x.clone()))
             .collect();
         let mainnet = chainstate.mainnet;
+        let mut cost_limit = options.read_only_call_limit.clone();
+        cost_limit.write_length = 0;
+        cost_limit.write_count = 0;
+
         let data_opt_res =
             chainstate.maybe_read_only_clarity_tx(&sortdb.index_conn(), tip, |clarity_tx| {
                 let cost_track = clarity_tx
                     .with_clarity_db_readonly(|clarity_db| {
-                        LimitedCostTracker::new_mid_block(
-                            mainnet,
-                            options.read_only_call_limit.clone(),
-                            clarity_db,
-                        )
+                        LimitedCostTracker::new_mid_block(mainnet, cost_limit, clarity_db)
                     })
                     .map_err(|_| {
                         ClarityRuntimeError::from(InterpreterError::CostContractLoadFailure)
                     })?;
 
                 clarity_tx.with_readonly_clarity_env(mainnet, sender.clone(), cost_track, |env| {
-                    env.execute_contract(&contract_identifier, function.as_str(), &args, true)
+                    // we want to execute any function as long as no actual writes are made as
+                    // opposed to be limited to purely calling `define-read-only` functions,
+                    // so use `read_only = false`.  This broadens the number of functions that
+                    // can be called, and also circumvents limitations on `define-read-only`
+                    // functions that can not use `contrac-call?`, even when calling other
+                    // read-only functions
+                    env.execute_contract(&contract_identifier, function.as_str(), &args, false)
                 })
             });
 
@@ -1229,14 +1200,28 @@ impl ConversationHttp {
                     cause: None,
                 },
             ),
-            Ok(Some(Err(e))) => HttpResponseType::CallReadOnlyFunction(
-                response_metadata,
-                CallReadOnlyResponse {
-                    okay: false,
-                    result: None,
-                    cause: Some(e.to_string()),
-                },
-            ),
+            Ok(Some(Err(e))) => match e {
+                Unchecked(CheckErrors::CostBalanceExceeded(actual_cost, _))
+                    if actual_cost.write_count > 0 =>
+                {
+                    HttpResponseType::CallReadOnlyFunction(
+                        response_metadata,
+                        CallReadOnlyResponse {
+                            okay: false,
+                            result: None,
+                            cause: Some("NotReadOnly".to_string()),
+                        },
+                    )
+                }
+                _ => HttpResponseType::CallReadOnlyFunction(
+                    response_metadata,
+                    CallReadOnlyResponse {
+                        okay: false,
+                        result: None,
+                        cause: Some(e.to_string()),
+                    },
+                ),
+            },
             Ok(None) | Err(_) => {
                 HttpResponseType::NotFound(response_metadata, "Chain tip not found".into())
             }
@@ -1265,8 +1250,7 @@ impl ConversationHttp {
             match chainstate.maybe_read_only_clarity_tx(&sortdb.index_conn(), tip, |clarity_tx| {
                 clarity_tx.with_clarity_db_readonly(|db| {
                     let source = db.get_contract_src(&contract_identifier)?;
-                    let contract_commit_key =
-                        MarfedKV::make_contract_hash_key(&contract_identifier);
+                    let contract_commit_key = make_contract_hash_key(&contract_identifier);
                     let (contract_commit, proof) = db
                         .get_with_proof::<ContractCommitment>(&contract_commit_key)
                         .expect("BUG: obtained source, but couldn't get MARF proof.");
@@ -1613,6 +1597,7 @@ impl ConversationHttp {
         let txid = tx.txid();
         let response_metadata = HttpResponseMetadata::from(req);
         let (response, accepted) = if mempool.has_tx(&txid) {
+            debug!("Mempool already has POSTed transaction {}", &txid);
             (
                 HttpResponseType::TransactionID(response_metadata, txid),
                 false,
@@ -1625,14 +1610,20 @@ impl ConversationHttp {
                 &tx,
                 event_observer,
             ) {
-                Ok(_) => (
-                    HttpResponseType::TransactionID(response_metadata, txid),
-                    true,
-                ),
-                Err(e) => (
-                    HttpResponseType::BadRequestJSON(response_metadata, e.into_json(&txid)),
-                    false,
-                ),
+                Ok(_) => {
+                    debug!("Mempool accepted POSTed transaction {}", &txid);
+                    (
+                        HttpResponseType::TransactionID(response_metadata, txid),
+                        true,
+                    )
+                }
+                Err(e) => {
+                    debug!("Mempool rejected POSTed transaction {}: {:?}", &txid, &e);
+                    (
+                        HttpResponseType::BadRequestJSON(response_metadata, e.into_json(&txid)),
+                        false,
+                    )
+                }
             }
         };
 
@@ -1828,11 +1819,8 @@ impl ConversationHttp {
     pub fn handle_request(
         &mut self,
         req: HttpRequestType,
-        chain_view: &BurnchainView,
-        peers: &PeerMap,
+        network: &mut PeerNetwork,
         sortdb: &SortitionDB,
-        peerdb: &PeerDB,
-        atlasdb: &mut AtlasDB,
         chainstate: &mut StacksChainState,
         mempool: &mut MemPoolDB,
         handler_opts: &RPCHandlerArgs,
@@ -1847,10 +1835,8 @@ impl ConversationHttp {
                     &mut self.connection.protocol,
                     &mut reply,
                     &req,
-                    &self.burnchain,
-                    sortdb,
+                    network,
                     chainstate,
-                    peerdb,
                     handler_opts,
                 )?;
                 None
@@ -1871,7 +1857,7 @@ impl ConversationHttp {
                         sortdb,
                         chainstate,
                         &tip,
-                        &self.burnchain,
+                        &network.burnchain,
                     )?;
                 }
                 None
@@ -1881,10 +1867,7 @@ impl ConversationHttp {
                     &mut self.connection.protocol,
                     &mut reply,
                     &req,
-                    self.network_id,
-                    chain_view,
-                    peers,
-                    peerdb,
+                    network,
                 )?;
                 None
             }
@@ -2103,7 +2086,7 @@ impl ConversationHttp {
                             tip.anchored_block_hash,
                             mempool,
                             tx.clone(),
-                            atlasdb,
+                            &mut network.atlasdb,
                             attachment.clone(),
                             handler_opts.event_observer.as_deref(),
                         )?;
@@ -2129,7 +2112,7 @@ impl ConversationHttp {
                     &mut self.connection.protocol,
                     &mut reply,
                     &req,
-                    atlasdb,
+                    &mut network.atlasdb,
                     content_hash.clone(),
                 )?;
                 None
@@ -2143,7 +2126,7 @@ impl ConversationHttp {
                     &mut self.connection.protocol,
                     &mut reply,
                     &req,
-                    atlasdb,
+                    &mut network.atlasdb,
                     &index_block_hash,
                     pages_indexes,
                     &self.connection.options,
@@ -2497,11 +2480,8 @@ impl ConversationHttp {
     /// Returns the list of transactions we'll need to forward to the peer network
     pub fn chat(
         &mut self,
-        chain_view: &BurnchainView,
-        peers: &PeerMap,
+        network: &mut PeerNetwork,
         sortdb: &SortitionDB,
-        peerdb: &PeerDB,
-        atlasdb: &mut AtlasDB,
         chainstate: &mut StacksChainState,
         mempool: &mut MemPoolDB,
         handler_args: &RPCHandlerArgs,
@@ -2530,17 +2510,7 @@ impl ConversationHttp {
                     self.total_request_count += 1;
                     self.last_request_timestamp = get_epoch_time_secs();
                     let msg_opt = monitoring::instrument_http_request_handler(req, |req| {
-                        self.handle_request(
-                            req,
-                            chain_view,
-                            peers,
-                            sortdb,
-                            peerdb,
-                            atlasdb,
-                            chainstate,
-                            mempool,
-                            handler_args,
-                        )
+                        self.handle_request(req, network, sortdb, chainstate, mempool, handler_args)
                     })?;
                     if let Some(msg) = msg_opt {
                         ret.push(msg);
@@ -2831,20 +2801,14 @@ impl ConversationHttp {
 
 #[cfg(test)]
 mod test {
-    use super::*;
-    use net::codec::*;
-    use net::http::*;
-    use net::test::*;
-    use net::*;
     use std::cell::RefCell;
+    use std::convert::TryInto;
     use std::iter::FromIterator;
 
+    use address::*;
     use burnchains::Burnchain;
-    use burnchains::BurnchainHeaderHash;
     use burnchains::BurnchainView;
-
     use burnchains::*;
-    use chainstate::burn::BlockHeaderHash;
     use chainstate::burn::ConsensusHash;
     use chainstate::stacks::db::blocks::test::*;
     use chainstate::stacks::db::BlockStreamData;
@@ -2853,16 +2817,20 @@ mod test {
     use chainstate::stacks::test::*;
     use chainstate::stacks::Error as chain_error;
     use chainstate::stacks::*;
-
-    use address::*;
-
+    use net::codec::*;
+    use net::http::*;
+    use net::test::*;
+    use net::*;
     use util::get_epoch_time_secs;
     use util::hash::hex_bytes;
     use util::pipe::*;
-
-    use std::convert::TryInto;
-
     use vm::types::*;
+
+    use crate::types::chainstate::BlockHeaderHash;
+    use crate::types::chainstate::BurnchainHeaderHash;
+    use chainstate::stacks::C32_ADDRESS_VERSION_TESTNET_SINGLESIG;
+
+    use super::*;
 
     const TEST_CONTRACT: &'static str = "
         (define-data-var bar int 0)
@@ -2871,7 +2839,7 @@ mod test {
         (define-public (set-bar (x int) (y int))
           (begin (var-set bar (/ x y)) (ok (var-get bar))))
         (define-public (add-unit)
-          (begin 
+          (begin
             (map-set unit-map { account: tx-sender } { units: 1 } )
             (ok 1)))
         (begin
@@ -3136,6 +3104,7 @@ mod test {
                     consensus_hash.clone(),
                     peer_1.chainstate(),
                     &sort_iconn,
+                    BlockBuilderSettings::max_value(),
                 )
                 .unwrap();
                 let microblock = microblock_builder
@@ -3191,8 +3160,6 @@ mod test {
         let view_2 = peer_2.get_burnchain_view().unwrap();
 
         let mut convo_1 = ConversationHttp::new(
-            peer_1.config.network_id,
-            &peer_1.config.burnchain,
             format!("127.0.0.1:{}", peer_1_http)
                 .parse::<SocketAddr>()
                 .unwrap(),
@@ -3203,8 +3170,6 @@ mod test {
         );
 
         let mut convo_2 = ConversationHttp::new(
-            peer_2.config.network_id,
-            &peer_2.config.burnchain,
             format!("127.0.0.1:{}", peer_2_http)
                 .parse::<SocketAddr>()
                 .unwrap(),
@@ -3236,11 +3201,8 @@ mod test {
 
         convo_1
             .chat(
-                &view_1,
-                &PeerMap::new(),
+                &mut peer_1.network,
                 &mut peer_1_sortdb,
-                &peer_1.network.peerdb,
-                &mut peer_1.network.atlasdb,
                 &mut peer_1_stacks_node.chainstate,
                 &mut peer_1_mempool,
                 &RPCHandlerArgs::default(),
@@ -3263,11 +3225,8 @@ mod test {
 
         convo_2
             .chat(
-                &view_2,
-                &PeerMap::new(),
+                &mut peer_2.network,
                 &mut peer_2_sortdb,
-                &peer_2.network.peerdb,
-                &mut peer_2.network.atlasdb,
                 &mut peer_2_stacks_node.chainstate,
                 &mut peer_2_mempool,
                 &RPCHandlerArgs::default(),
@@ -3304,11 +3263,8 @@ mod test {
 
         convo_1
             .chat(
-                &view_1,
-                &PeerMap::new(),
+                &mut peer_1.network,
                 &mut peer_1_sortdb,
-                &peer_1.network.peerdb,
-                &mut peer_1.network.atlasdb,
                 &mut peer_1_stacks_node.chainstate,
                 &mut peer_1_mempool,
                 &RPCHandlerArgs::default(),
@@ -3343,15 +3299,12 @@ mod test {
              ref mut convo_client,
              ref mut peer_server,
              ref mut convo_server| {
-                let peer_info = RPCPeerInfoData::from_db(
-                    &peer_server.config.burnchain,
-                    peer_server.sortdb.as_mut().unwrap(),
+                let peer_info = RPCPeerInfoData::from_network(
+                    &peer_server.network,
                     &peer_server.stacks_node.as_ref().unwrap().chainstate,
-                    &peer_server.network.peerdb,
                     &None,
                     &Sha256Sum::zero(),
-                )
-                .unwrap();
+                );
 
                 *peer_server_info.borrow_mut() = Some(peer_info);
 

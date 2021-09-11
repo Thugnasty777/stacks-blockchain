@@ -20,18 +20,18 @@ use rusqlite::types::ToSql;
 use rusqlite::Row;
 
 use burnchains::Address;
-
 use chainstate::stacks::db::blocks::*;
 use chainstate::stacks::db::*;
 use chainstate::stacks::Error;
 use chainstate::stacks::*;
-use vm::clarity::{ClarityConnection, ClarityTransactionConnection};
-use vm::database::marf::*;
+use clarity_vm::clarity::{ClarityConnection, ClarityTransactionConnection};
+use util::db::Error as db_error;
+use util::db::*;
+use vm::database::clarity_store::*;
 use vm::database::*;
 use vm::types::*;
 
-use util::db::Error as db_error;
-use util::db::*;
+use crate::types::chainstate::{StacksAddress, StacksBlockHeader, StacksBlockId};
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct MinerReward {
@@ -314,9 +314,9 @@ impl StacksChainState {
         block_reward: &MinerPaymentSchedule,
         user_burns: &Vec<StagingUserBurnSupport>,
     ) -> Result<(), Error> {
-        assert!(block_reward.burnchain_commit_burn < i64::max_value() as u64);
-        assert!(block_reward.burnchain_sortition_burn < i64::max_value() as u64);
-        assert!(block_reward.stacks_block_height < i64::max_value() as u64);
+        assert!(block_reward.burnchain_commit_burn < i64::MAX as u64);
+        assert!(block_reward.burnchain_sortition_burn < i64::MAX as u64);
+        assert!(block_reward.stacks_block_height < i64::MAX as u64);
 
         let index_block_hash = StacksBlockHeader::make_index_block_hash(
             &block_reward.consensus_hash,
@@ -364,7 +364,7 @@ impl StacksChainState {
         .map_err(|e| Error::DBError(db_error::SqliteError(e)))?;
 
         for user_support in user_burns.iter() {
-            assert!(user_support.burn_amount < i64::max_value() as u64);
+            assert!(user_support.burn_amount < i64::MAX as u64);
 
             let args: &[&dyn ToSql] = &[
                 &user_support.address.to_string(),
@@ -742,7 +742,6 @@ impl StacksChainState {
 
 #[cfg(test)]
 mod test {
-    use super::*;
     use burnchains::*;
     use chainstate::burn::*;
     use chainstate::stacks::db::test::*;
@@ -751,6 +750,10 @@ mod test {
     use chainstate::stacks::*;
     use util::hash::*;
     use vm::costs::ExecutionCost;
+
+    use crate::types::chainstate::BurnchainHeaderHash;
+
+    use super::*;
 
     fn make_dummy_miner_payment_schedule(
         addr: &StacksAddress,

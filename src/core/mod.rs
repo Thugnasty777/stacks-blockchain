@@ -14,17 +14,19 @@
 // You should have received a copy of the GNU General Public License
 // along with this program.  If not, see <http://www.gnu.org/licenses/>.
 
+use burnchains::Burnchain;
 // This module contains the "main loop" that drives everything
 use burnchains::Error as burnchain_error;
-use burnchains::{Burnchain, BurnchainHeaderHash};
-use chainstate::burn::{BlockHeaderHash, ConsensusHash};
+use chainstate::burn::ConsensusHash;
 use chainstate::coordinator::comm::CoordinatorCommunication;
 use util::log;
 use vm::costs::ExecutionCost;
 
-pub mod mempool;
+use crate::types::chainstate::{BlockHeaderHash, BurnchainHeaderHash};
 
 pub use self::mempool::MemPoolDB;
+
+pub mod mempool;
 
 // fork set identifier -- to be mixed with the consensus hash (encodes the version)
 pub const SYSTEM_FORK_SET_VERSION: [u8; 4] = [23u8, 0u8, 0u8, 0u8];
@@ -65,9 +67,10 @@ pub const INITIAL_MINING_BONUS_WINDOW: u16 = 10;
 pub const INITIAL_MINING_BONUS_WINDOW: u16 = 10_000;
 
 pub const STACKS_2_0_LAST_BLOCK_TO_PROCESS: u64 = 700_000;
+pub const MAINNET_2_0_GENESIS_ROOT_HASH: &str =
+    "9653c92b1ad726e2dc17862a3786f7438ab9239c16dd8e7aaba8b0b5c34b52af";
 
-// first burnchain block hash
-// TODO: update once we know the true first burnchain block
+/// This is the "dummy" parent to the actual first burnchain block that we process.
 pub const FIRST_BURNCHAIN_CONSENSUS_HASH: ConsensusHash = ConsensusHash([0u8; 20]);
 
 // TODO: TO BE SET BY STACKS_V1_MINER_THRESHOLD
@@ -77,10 +80,10 @@ pub const BITCOIN_MAINNET_FIRST_BLOCK_HASH: &str =
     "0000000000000000000ab248c8e35c574514d052a83dbc12669e19bc43df486e";
 pub const BITCOIN_MAINNET_INITIAL_REWARD_START_BLOCK: u64 = 651389;
 
-pub const BITCOIN_TESTNET_FIRST_BLOCK_HEIGHT: u64 = 1931620;
-pub const BITCOIN_TESTNET_FIRST_BLOCK_TIMESTAMP: u32 = 1612282029;
+pub const BITCOIN_TESTNET_FIRST_BLOCK_HEIGHT: u64 = 2000000;
+pub const BITCOIN_TESTNET_FIRST_BLOCK_TIMESTAMP: u32 = 1622691840;
 pub const BITCOIN_TESTNET_FIRST_BLOCK_HASH: &str =
-    "00000000000000b8275ac9907d4d8f3b862f93d6f986ba628a2784748e56e51b";
+    "000000000000010dd0863ec3d7a0bae17c1957ae1de9cbcdae8e77aad33e3b8c";
 
 pub const BITCOIN_REGTEST_FIRST_BLOCK_HEIGHT: u64 = 0;
 pub const BITCOIN_REGTEST_FIRST_BLOCK_TIMESTAMP: u32 = 0;
@@ -119,6 +122,15 @@ pub const BLOCK_LIMIT_MAINNET: ExecutionCost = ExecutionCost {
     runtime: 5_000_000_000,
 };
 
+pub const HELIUM_BLOCK_LIMIT: ExecutionCost = ExecutionCost {
+    write_length: 15_0_000_000,
+    write_count: 5_0_000,
+    read_length: 1_000_000_000,
+    read_count: 5_0_000,
+    // allow much more runtime in helium blocks than mainnet
+    runtime: 100_000_000_000,
+};
+
 pub const FAULT_DISABLE_MICROBLOCKS_COST_CHECK: &str = "MICROBLOCKS_DISABLE_COST_CHECK";
 pub const FAULT_DISABLE_MICROBLOCKS_BYTES_CHECK: &str = "MICROBLOCKS_DISABLE_BYTES_CHECK";
 
@@ -131,33 +143,4 @@ pub fn check_fault_injection(fault_name: &str) -> bool {
     }
 
     env::var(fault_name) == Ok("1".to_string())
-}
-
-/// Synchronize burn transactions from the Bitcoin blockchain
-pub fn sync_burnchain_bitcoin(
-    working_dir: &String,
-    network_name: &String,
-) -> Result<u64, burnchain_error> {
-    use burnchains::bitcoin::indexer::BitcoinIndexer;
-    let channels = CoordinatorCommunication::instantiate();
-
-    let mut burnchain =
-        Burnchain::new(working_dir, &"bitcoin".to_string(), network_name).map_err(|e| {
-            error!(
-                "Failed to instantiate burn chain driver for {}: {:?}",
-                network_name, e
-            );
-            e
-        })?;
-
-    let new_height_res = burnchain.sync::<BitcoinIndexer>(&channels.1, None, None);
-    let new_height = new_height_res.map_err(|e| {
-        error!(
-            "Failed to synchronize Bitcoin chain state for {} in {}",
-            network_name, working_dir
-        );
-        e
-    })?;
-
-    Ok(new_height)
 }

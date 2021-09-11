@@ -27,6 +27,32 @@ extern crate rusqlite;
 #[macro_use(o, slog_log, slog_trace, slog_debug, slog_info, slog_warn, slog_error)]
 extern crate slog;
 
+use std::io;
+use std::io::prelude::*;
+use std::process;
+use std::{collections::HashMap, env};
+use std::{convert::TryFrom, fs};
+
+use rusqlite::types::ToSql;
+use rusqlite::Connection;
+use rusqlite::OpenFlags;
+
+use blockstack_lib::burnchains::bitcoin::spv;
+use blockstack_lib::burnchains::bitcoin::BitcoinNetworkType;
+use blockstack_lib::chainstate::burn::ConsensusHash;
+use blockstack_lib::chainstate::stacks::db::ChainStateBootData;
+use blockstack_lib::chainstate::stacks::index::marf::MarfConnection;
+use blockstack_lib::chainstate::stacks::index::marf::MARF;
+use blockstack_lib::chainstate::stacks::miner::*;
+use blockstack_lib::chainstate::stacks::*;
+use blockstack_lib::codec::StacksMessageCodec;
+use blockstack_lib::types::chainstate::{BlockHeaderHash, BurnchainHeaderHash, PoxId};
+use blockstack_lib::types::chainstate::{StacksBlockHeader, StacksBlockId};
+use blockstack_lib::types::proof::ClarityMarfTrieId;
+use blockstack_lib::util::get_epoch_time_ms;
+use blockstack_lib::util::hash::{hex_bytes, to_hex};
+use blockstack_lib::util::log;
+use blockstack_lib::util::retry::LogReader;
 use blockstack_lib::*;
 use blockstack_lib::{
     burnchains::{db::BurnchainBlockData, PoxConstants},
@@ -42,35 +68,6 @@ use blockstack_lib::{
     net::{db::LocalPeer, p2p::PeerNetwork, PeerAddress},
     vm::representations::UrlString,
 };
-
-use std::io;
-use std::io::prelude::*;
-use std::process;
-use std::{collections::HashMap, env};
-use std::{convert::TryFrom, fs};
-
-use blockstack_lib::util::log;
-
-use blockstack_lib::burnchains::BurnchainHeaderHash;
-use blockstack_lib::chainstate::burn::BlockHeaderHash;
-use blockstack_lib::chainstate::burn::ConsensusHash;
-use blockstack_lib::chainstate::stacks::db::ChainStateBootData;
-use blockstack_lib::chainstate::stacks::index::marf::MarfConnection;
-use blockstack_lib::chainstate::stacks::index::marf::MARF;
-use blockstack_lib::chainstate::stacks::StacksBlockHeader;
-use blockstack_lib::chainstate::stacks::*;
-use blockstack_lib::net::StacksMessageCodec;
-use blockstack_lib::util::hash::{hex_bytes, to_hex};
-use blockstack_lib::util::retry::LogReader;
-
-use blockstack_lib::burnchains::bitcoin::spv;
-use blockstack_lib::burnchains::bitcoin::BitcoinNetworkType;
-
-use rusqlite::types::ToSql;
-use rusqlite::Connection;
-use rusqlite::OpenFlags;
-
-use blockstack_lib::util::get_epoch_time_ms;
 
 fn main() {
     let mut argv: Vec<String> = env::args().collect();
@@ -423,7 +420,7 @@ check if the associated microblocks can be downloaded
     if argv[1] == "try-mine" {
         if argv.len() < 3 {
             eprintln!(
-                "Usage: {} try-mine <working-dir>
+                "Usage: {} try-mine <working-dir> [min-fee [max-time]]
 
 Given a <working-dir>, try to ''mine'' an anchored block. This invokes the miner block
 assembly, but does not attempt to broadcast a block commit. This is useful for determining
@@ -435,8 +432,19 @@ simulating a miner.
             process::exit(1);
         }
 
+        let start = get_epoch_time_ms();
         let sort_db_path = format!("{}/mainnet/burnchain/sortition", &argv[2]);
         let chain_state_path = format!("{}/mainnet/chainstate/", &argv[2]);
+
+        let mut min_fee = u64::max_value();
+        let mut max_time = u64::max_value();
+
+        if argv.len() >= 4 {
+            min_fee = argv[3].parse().expect("Could not parse min_fee");
+        }
+        if argv.len() >= 5 {
+            max_time = argv[4].parse().expect("Could not parse max_time");
+        }
 
         let sort_db = SortitionDB::open(&sort_db_path, false)
             .expect(&format!("Failed to open {}", &sort_db_path));
@@ -474,6 +482,10 @@ simulating a miner.
         tx_signer.sign_origin(&sk).unwrap();
         let coinbase_tx = tx_signer.get_tx().unwrap();
 
+        let mut settings = BlockBuilderSettings::limited(core::BLOCK_LIMIT_MAINNET.clone());
+        settings.max_miner_time_ms = max_time;
+        settings.mempool_settings.min_tx_fee = min_fee;
+
         let result = StacksBlockBuilder::build_anchored_block(
             &chain_state,
             &sort_db.index_conn(),
@@ -483,19 +495,45 @@ simulating a miner.
             VRFProof::empty(),
             Hash160([0; 20]),
             &coinbase_tx,
-            core::BLOCK_LIMIT_MAINNET.clone(),
+            settings,
             None,
         );
 
+        let stop = get_epoch_time_ms();
+
         println!(
-            "{} mined block @ height = {}",
+            "{} mined block @ height = {} off of {} ({}/{}) in {}ms. Min-fee: {}, Max-time: {}",
             if result.is_ok() {
                 "Successfully"
             } else {
                 "Failed to"
             },
-            parent_header.block_height + 1
+            parent_header.block_height + 1,
+            StacksBlockHeader::make_index_block_hash(
+                &parent_header.consensus_hash,
+                &parent_header.anchored_header.block_hash()
+            ),
+            &parent_header.consensus_hash,
+            &parent_header.anchored_header.block_hash(),
+            stop.saturating_sub(start),
+            min_fee,
+            max_time
         );
+
+        if let Ok((block, execution_cost, size)) = result {
+            let mut total_fees = 0;
+            for tx in block.txs.iter() {
+                total_fees += tx.get_tx_fee();
+            }
+            println!(
+                "Block {}: {} uSTX, {} bytes, cost {:?}",
+                block.block_hash(),
+                total_fees,
+                size,
+                &execution_cost
+            );
+        }
+
         process::exit(0);
     }
 
@@ -685,17 +723,17 @@ simulating a miner.
     }
 
     if argv[1] == "replay-chainstate" {
+        use blockstack_lib::types::chainstate::StacksAddress;
+        use blockstack_lib::types::chainstate::StacksBlockHeader;
         use burnchains::bitcoin::indexer::BitcoinIndexer;
         use burnchains::db::BurnchainDB;
         use burnchains::Address;
         use burnchains::Burnchain;
-        use chainstate::burn::db::sortdb::{PoxId, SortitionDB};
+        use chainstate::burn::db::sortdb::SortitionDB;
         use chainstate::burn::BlockSnapshot;
         use chainstate::stacks::db::blocks::StagingBlock;
         use chainstate::stacks::db::StacksChainState;
         use chainstate::stacks::index::MarfTrieId;
-        use chainstate::stacks::StacksAddress;
-        use chainstate::stacks::StacksBlockHeader;
         use core::*;
         use net::relay::Relayer;
         use std::collections::HashMap;
@@ -720,28 +758,28 @@ simulating a miner.
             StacksChainState::open(false, 0x80000000, old_chainstate_path).unwrap();
         let old_sortition_db = SortitionDB::open(old_sort_path, true).unwrap();
 
-        // initial argon balances -- see testnet/stacks-node/conf/argon-follower-conf.toml
+        // initial argon balances -- see testnet/stacks-node/conf/testnet-follower-conf.toml
         let initial_balances = vec![
             (
-                StacksAddress::from_string("STB44HYPYAT2BB2QE513NSP81HTMYWBJP02HPGK6")
+                StacksAddress::from_string("ST2QKZ4FKHAH1NQKYKYAYZPY440FEPK7GZ1R5HBP2")
                     .unwrap()
                     .to_account_principal(),
                 10000000000000000,
             ),
             (
-                StacksAddress::from_string("ST11NJTTKGVT6D1HY4NJRVQWMQM7TVAR091EJ8P2Y")
+                StacksAddress::from_string("ST319CF5WV77KYR1H3GT0GZ7B8Q4AQPY42ETP1VPF")
                     .unwrap()
                     .to_account_principal(),
                 10000000000000000,
             ),
             (
-                StacksAddress::from_string("ST1HB1T8WRNBYB0Y3T7WXZS38NKKPTBR3EG9EPJKR")
+                StacksAddress::from_string("ST221Z6TDTC5E0BYR2V624Q2ST6R0Q71T78WTAX6H")
                     .unwrap()
                     .to_account_principal(),
                 10000000000000000,
             ),
             (
-                StacksAddress::from_string("STRYYQQ9M8KAF4NS7WNZQYY59X93XEKR31JP64CP")
+                StacksAddress::from_string("ST2TFVBMRPS5SSNP98DQKQ5JNB2B6NZM91C4K3P7B")
                     .unwrap()
                     .to_account_principal(),
                 10000000000000000,
@@ -759,8 +797,13 @@ simulating a miner.
         let burnchain = Burnchain::regtest(&burnchain_db_path);
         let first_burnchain_block_height = burnchain.first_block_height;
         let first_burnchain_block_hash = burnchain.first_block_hash;
-        let indexer: BitcoinIndexer = burnchain.make_indexer().unwrap();
-        let (mut new_sortition_db, _) = burnchain.connect_db(&indexer, true).unwrap();
+        let (mut new_sortition_db, _) = burnchain
+            .connect_db(
+                true,
+                first_burnchain_block_hash,
+                BITCOIN_REGTEST_FIRST_BLOCK_TIMESTAMP.into(),
+            )
+            .unwrap();
 
         let old_burnchaindb = BurnchainDB::connect(
             &old_burnchaindb_path,
@@ -777,6 +820,7 @@ simulating a miner.
             first_burnchain_block_hash,
             first_burnchain_block_height: first_burnchain_block_height as u32,
             first_burnchain_block_timestamp: 0,
+            pox_constants: PoxConstants::regtest_default(),
             get_bulk_initial_lockups: None,
             get_bulk_initial_balances: None,
             get_bulk_initial_namespaces: None,
@@ -842,7 +886,13 @@ simulating a miner.
         let mut known_stacks_blocks = HashSet::new();
         let mut next_arrival = 0;
 
-        let (p2p_new_sortition_db, _) = burnchain.connect_db(&indexer, true).unwrap();
+        let (p2p_new_sortition_db, _) = burnchain
+            .connect_db(
+                true,
+                first_burnchain_block_hash,
+                BITCOIN_REGTEST_FIRST_BLOCK_TIMESTAMP.into(),
+            )
+            .unwrap();
         let (mut p2p_chainstate, _) = StacksChainState::open_with_block_limit(
             false,
             0x80000000,
