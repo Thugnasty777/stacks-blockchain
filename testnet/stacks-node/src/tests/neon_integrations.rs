@@ -1,52 +1,3 @@
-use super::{
-    make_contract_call, make_contract_publish, make_contract_publish_microblock_only,
-    make_microblock, make_stacks_transfer, make_stacks_transfer_mblock_only, to_addr, ADDR_4, SK_1,
-    SK_2,
-};
-use stacks::core;
-use stacks::core::CHAIN_ID_TESTNET;
-use stacks::net::StacksMessageCodec;
-use stacks::util::secp256k1::Secp256k1PublicKey;
-use stacks::vm::database::ClarityDeserializable;
-use stacks::vm::execute;
-use stacks::vm::types::PrincipalData;
-use stacks::vm::Value;
-use stacks::{
-    burnchains::db::BurnchainDB,
-    chainstate::{
-        burn::{BlockHeaderHash, ConsensusHash},
-        stacks::StacksMicroblock,
-    },
-};
-use stacks::{
-    burnchains::{Address, Burnchain, PoxConstants},
-    vm::costs::ExecutionCost,
-};
-use stacks::{
-    chainstate::stacks::{
-        db::StacksChainState, StacksAddress, StacksBlock, StacksBlockHeader, StacksBlockId,
-        StacksPrivateKey, StacksPublicKey, StacksTransaction, TransactionPayload,
-    },
-    net::RPCPoxInfoData,
-    util::db::query_row_columns,
-    util::db::query_rows,
-    util::db::u64_to_sql,
-};
-
-use super::bitcoin_regtest::BitcoinCoreController;
-use crate::{
-    burnchains::bitcoin_regtest_controller::UTXO, config::EventKeyType,
-    config::EventObserverConfig, config::InitialBalance, neon, operations::BurnchainOpSigner,
-    BitcoinRegtestController, BurnchainController, Config, ConfigFile, Keychain,
-};
-use stacks::net::atlas::{AtlasConfig, AtlasDB, MAX_ATTACHMENT_INV_PAGES_PER_REQUEST};
-use stacks::net::{
-    AccountEntryResponse, GetAttachmentResponse, GetAttachmentsInvResponse,
-    PostTransactionRequestBody, RPCPeerInfoData,
-};
-use stacks::util::hash::Hash160;
-use stacks::util::hash::{bytes_to_hex, hex_bytes};
-use stacks::util::{get_epoch_time_ms, get_epoch_time_secs, sleep_ms};
 use std::cmp;
 use std::sync::mpsc;
 use std::sync::Arc;
@@ -57,14 +8,70 @@ use std::{
 };
 use std::{env, thread};
 
+use rusqlite::types::ToSql;
+
+use crate::util::boot::boot_code_id;
 use stacks::burnchains::bitcoin::address::{BitcoinAddress, BitcoinAddressType};
 use stacks::burnchains::bitcoin::BitcoinNetworkType;
-use stacks::burnchains::{BurnchainHeaderHash, Txid};
+use stacks::burnchains::Txid;
 use stacks::chainstate::burn::operations::{BlockstackOperationType, PreStxOp, TransferStxOp};
-use stacks::chainstate::stacks::boot::boot_code_id;
+use stacks::codec::StacksMessageCodec;
+use stacks::core;
 use stacks::core::BLOCK_LIMIT_MAINNET;
+use stacks::core::CHAIN_ID_TESTNET;
+use stacks::net::atlas::{AtlasConfig, AtlasDB, MAX_ATTACHMENT_INV_PAGES_PER_REQUEST};
+use stacks::net::{
+    AccountEntryResponse, GetAttachmentResponse, GetAttachmentsInvResponse,
+    PostTransactionRequestBody, RPCPeerInfoData,
+};
+use stacks::types::chainstate::{
+    BlockHeaderHash, BurnchainHeaderHash, StacksAddress, StacksBlockHeader, StacksBlockId,
+    StacksMicroblockHeader,
+};
+use stacks::util::hash::Hash160;
+use stacks::util::hash::{bytes_to_hex, hex_bytes};
+use stacks::util::secp256k1::Secp256k1PublicKey;
+use stacks::util::{get_epoch_time_ms, get_epoch_time_secs, sleep_ms};
+use stacks::vm::database::ClarityDeserializable;
+use stacks::vm::execute;
+use stacks::vm::types::PrincipalData;
+use stacks::vm::Value;
+use stacks::{
+    burnchains::db::BurnchainDB,
+    chainstate::{burn::ConsensusHash, stacks::StacksMicroblock},
+};
+use stacks::{
+    burnchains::{Address, Burnchain, PoxConstants},
+    vm::costs::ExecutionCost,
+};
+use stacks::{
+    chainstate::stacks::{
+        db::StacksChainState, StacksBlock, StacksPrivateKey, StacksPublicKey, StacksTransaction,
+        TransactionPayload,
+    },
+    net::RPCPoxInfoData,
+    util::db::query_row_columns,
+    util::db::query_rows,
+    util::db::u64_to_sql,
+};
 
-use rusqlite::types::ToSql;
+use crate::{
+    burnchains::bitcoin_regtest_controller::UTXO, config::EventKeyType,
+    config::EventObserverConfig, config::InitialBalance, neon, operations::BurnchainOpSigner,
+    BitcoinRegtestController, BurnchainController, Config, ConfigFile, Keychain,
+};
+
+use crate::util::hash::{MerkleTree, Sha512Trunc256Sum};
+use crate::util::secp256k1::MessageSignature;
+
+use rand::Rng;
+
+use super::bitcoin_regtest::BitcoinCoreController;
+use super::{
+    make_contract_call, make_contract_publish, make_contract_publish_microblock_only,
+    make_microblock, make_stacks_transfer, make_stacks_transfer_mblock_only, to_addr, ADDR_4, SK_1,
+    SK_2,
+};
 
 fn neon_integration_test_conf() -> (Config, StacksAddress) {
     let mut conf = super::new_test_conf();
@@ -87,10 +94,14 @@ fn neon_integration_test_conf() -> (Config, StacksAddress) {
     let magic_bytes = Config::from_config_file(ConfigFile::xenon())
         .burnchain
         .magic_bytes;
-    assert_eq!(magic_bytes.as_bytes(), &['X' as u8, '6' as u8]);
+    assert_eq!(magic_bytes.as_bytes(), &['T' as u8, '2' as u8]);
     conf.burnchain.magic_bytes = magic_bytes;
     conf.burnchain.poll_time_secs = 1;
     conf.node.pox_sync_sample_secs = 0;
+
+    conf.miner.min_tx_fee = 1;
+    conf.miner.first_attempt_time_ms = i64::max_value() as u64;
+    conf.miner.subsequent_attempt_time_ms = i64::max_value() as u64;
 
     let miner_account = keychain.origin_address(conf.is_mainnet()).unwrap();
 
@@ -101,6 +112,7 @@ mod test_observer {
     use std::convert::Infallible;
     use std::sync::Mutex;
     use std::thread;
+
     use tokio;
     use warp;
     use warp::Filter;
@@ -109,6 +121,7 @@ mod test_observer {
 
     lazy_static! {
         pub static ref NEW_BLOCKS: Mutex<Vec<serde_json::Value>> = Mutex::new(Vec::new());
+        pub static ref NEW_MICROBLOCKS: Mutex<Vec<serde_json::Value>> = Mutex::new(Vec::new());
         pub static ref BURN_BLOCKS: Mutex<Vec<serde_json::Value>> = Mutex::new(Vec::new());
         pub static ref MEMTXS: Mutex<Vec<String>> = Mutex::new(Vec::new());
         pub static ref MEMTXS_DROPPED: Mutex<Vec<(String, String)>> = Mutex::new(Vec::new());
@@ -126,6 +139,14 @@ mod test_observer {
     async fn handle_block(block: serde_json::Value) -> Result<impl warp::Reply, Infallible> {
         let mut blocks = NEW_BLOCKS.lock().unwrap();
         blocks.push(block);
+        Ok(warp::http::StatusCode::OK)
+    }
+
+    async fn handle_microblocks(
+        microblocks: serde_json::Value,
+    ) -> Result<impl warp::Reply, Infallible> {
+        let mut microblock_events = NEW_MICROBLOCKS.lock().unwrap();
+        microblock_events.push(microblocks);
         Ok(warp::http::StatusCode::OK)
     }
 
@@ -184,6 +205,10 @@ mod test_observer {
         NEW_BLOCKS.lock().unwrap().clone()
     }
 
+    pub fn get_microblocks() -> Vec<serde_json::Value> {
+        NEW_MICROBLOCKS.lock().unwrap().clone()
+    }
+
     pub fn get_burn_blocks() -> Vec<serde_json::Value> {
         BURN_BLOCKS.lock().unwrap().clone()
     }
@@ -192,6 +217,7 @@ mod test_observer {
         ATTACHMENTS.lock().unwrap().clone()
     }
 
+    /// each path here should correspond to one of the paths listed in `event_dispatcher.rs`
     async fn serve() {
         let new_blocks = warp::path!("new_block")
             .and(warp::post())
@@ -213,6 +239,10 @@ mod test_observer {
             .and(warp::post())
             .and(warp::body::json())
             .and_then(handle_attachments);
+        let new_microblocks = warp::path!("new_microblocks")
+            .and(warp::post())
+            .and(warp::body::json())
+            .and_then(handle_microblocks);
 
         info!("Spawning warp server");
         warp::serve(
@@ -220,7 +250,8 @@ mod test_observer {
                 .or(mempool_txs)
                 .or(mempool_drop_txs)
                 .or(new_burn_blocks)
-                .or(new_attachments),
+                .or(new_attachments)
+                .or(new_microblocks),
         )
         .run(([127, 0, 0, 1], EVENT_OBSERVER_PORT))
         .await
@@ -247,7 +278,7 @@ const PANIC_TIMEOUT_SECS: u64 = 600;
 fn next_block_and_wait(
     btc_controller: &mut BitcoinRegtestController,
     blocks_processed: &Arc<AtomicU64>,
-) {
+) -> bool {
     let current = blocks_processed.load(Ordering::SeqCst);
     eprintln!(
         "Issuing block at {}, waiting for bump ({})",
@@ -259,7 +290,7 @@ fn next_block_and_wait(
     while blocks_processed.load(Ordering::SeqCst) <= current {
         if start.elapsed() > Duration::from_secs(PANIC_TIMEOUT_SECS) {
             error!("Timed out waiting for block to process, trying to continue test");
-            return;
+            return false;
         }
         thread::sleep(Duration::from_millis(100));
     }
@@ -268,6 +299,7 @@ fn next_block_and_wait(
         get_epoch_time_secs(),
         blocks_processed.load(Ordering::SeqCst)
     );
+    true
 }
 
 fn wait_for_runloop(blocks_processed: &Arc<AtomicU64>) {
@@ -283,12 +315,12 @@ fn wait_for_runloop(blocks_processed: &Arc<AtomicU64>) {
 fn wait_for_microblocks(microblocks_processed: &Arc<AtomicU64>, timeout: u64) -> bool {
     let mut current = microblocks_processed.load(Ordering::SeqCst);
     let start = Instant::now();
-
+    info!("Waiting for next microblock");
     loop {
         let now = microblocks_processed.load(Ordering::SeqCst);
         if now == 0 && current != 0 {
             // wrapped around -- a new epoch started
-            debug!(
+            info!(
                 "New microblock epoch started while waiting (originally {})",
                 current
             );
@@ -349,8 +381,7 @@ fn get_tip_anchored_block(conf: &Config) -> (ConsensusHash, StacksBlock) {
         .json::<RPCPeerInfoData>()
         .unwrap();
     let stacks_tip = tip_info.stacks_tip;
-    let stacks_tip_consensus_hash =
-        ConsensusHash::from_hex(&tip_info.stacks_tip_consensus_hash).unwrap();
+    let stacks_tip_consensus_hash = tip_info.stacks_tip_consensus_hash;
 
     let stacks_id_tip =
         StacksBlockHeader::make_index_block_hash(&stacks_tip_consensus_hash, &stacks_tip);
@@ -387,7 +418,9 @@ fn bitcoind_integration_test() {
         return;
     }
 
-    let (conf, miner_account) = neon_integration_test_conf();
+    let (mut conf, miner_account) = neon_integration_test_conf();
+    let prom_bind = format!("{}:{}", "127.0.0.1", 6000);
+    conf.node.prometheus_bind = Some(prom_bind.clone());
 
     let mut btcd_controller = BitcoinCoreController::new(conf.clone());
     btcd_controller
@@ -428,6 +461,141 @@ fn bitcoind_integration_test() {
     let account = get_account(&http_origin, &miner_account);
     assert_eq!(account.balance, 0);
     assert_eq!(account.nonce, 1);
+
+    // query for prometheus metrics
+    #[cfg(feature = "monitoring_prom")]
+    {
+        let prom_http_origin = format!("http://{}", prom_bind);
+        let client = reqwest::blocking::Client::new();
+        let res = client
+            .get(&prom_http_origin)
+            .send()
+            .unwrap()
+            .text()
+            .unwrap();
+        assert!(res.contains("stacks_node_computed_miner_commitment_high 0"));
+        assert!(res.contains("stacks_node_computed_miner_commitment_low 1"));
+        assert!(res.contains("stacks_node_computed_relative_miner_score 100"));
+        assert!(res.contains("stacks_node_miner_current_median_commitment_high 0"));
+        assert!(res.contains("stacks_node_miner_current_median_commitment_low 1"));
+        assert!(res.contains("stacks_node_active_miners_total 1"));
+    }
+
+    channel.stop_chains_coordinator();
+}
+
+#[test]
+#[ignore]
+fn most_recent_utxo_integration_test() {
+    if env::var("BITCOIND_TEST") != Ok("1".into()) {
+        return;
+    }
+
+    let (conf, _) = neon_integration_test_conf();
+
+    let mut btcd_controller = BitcoinCoreController::new(conf.clone());
+    btcd_controller
+        .start_bitcoind()
+        .map_err(|_e| ())
+        .expect("Failed starting bitcoind");
+
+    let mut btc_regtest_controller = BitcoinRegtestController::new(conf.clone(), None);
+
+    btc_regtest_controller.bootstrap_chain(201);
+
+    eprintln!("Chain bootstrapped...");
+
+    let mut run_loop = neon::RunLoop::new(conf.clone());
+    let blocks_processed = run_loop.get_blocks_processed_arc();
+
+    let channel = run_loop.get_coordinator_channel().unwrap();
+
+    thread::spawn(move || run_loop.start(None, 0));
+
+    // give the run loop some time to start up!
+    wait_for_runloop(&blocks_processed);
+
+    // first block wakes up the run loop
+    next_block_and_wait(&mut btc_regtest_controller, &blocks_processed);
+
+    // first block will hold our VRF registration
+    next_block_and_wait(&mut btc_regtest_controller, &blocks_processed);
+
+    // second block will be the first mined Stacks block
+    next_block_and_wait(&mut btc_regtest_controller, &blocks_processed);
+
+    let mut miner_signer = Keychain::default(conf.node.seed.clone()).generate_op_signer();
+    let pubkey = miner_signer.get_public_key();
+    let utxos_before = btc_regtest_controller.get_all_utxos(&pubkey);
+
+    let mut last_utxo: Option<UTXO> = None;
+    let mut smallest_utxo: Option<UTXO> = None; // smallest non-dust UTXO
+    let mut biggest_utxo: Option<UTXO> = None;
+    for utxo in utxos_before.iter() {
+        if let Some(last) = last_utxo {
+            if utxo.confirmations < last.confirmations {
+                last_utxo = Some(utxo.clone());
+            } else {
+                last_utxo = Some(last);
+            }
+        } else {
+            last_utxo = Some(utxo.clone());
+        }
+
+        if let Some(smallest) = smallest_utxo {
+            if utxo.amount > 5500 && utxo.amount < smallest.amount {
+                smallest_utxo = Some(utxo.clone());
+            } else {
+                smallest_utxo = Some(smallest);
+            }
+        } else {
+            smallest_utxo = Some(utxo.clone());
+        }
+
+        if let Some(biggest) = biggest_utxo {
+            if utxo.amount > biggest.amount {
+                biggest_utxo = Some(utxo.clone());
+            } else {
+                biggest_utxo = Some(biggest);
+            }
+        } else {
+            biggest_utxo = Some(utxo.clone());
+        }
+    }
+
+    let last_utxo = last_utxo.unwrap();
+    let smallest_utxo = smallest_utxo.unwrap();
+    let mut biggest_utxo = biggest_utxo.unwrap();
+
+    eprintln!("Last-spent UTXO is {:?}", &last_utxo);
+    eprintln!("Smallest UTXO is {:?}", &smallest_utxo);
+    eprintln!("Biggest UTXO is {:?}", &biggest_utxo);
+
+    assert_eq!(last_utxo, smallest_utxo);
+    assert_ne!(biggest_utxo, last_utxo);
+    assert_ne!(biggest_utxo, smallest_utxo);
+
+    // third block will be the second mined Stacks block, and mining it should *not* spend the
+    // biggest UTXO, but should spend the *smallest non-dust* UTXO
+    next_block_and_wait(&mut btc_regtest_controller, &blocks_processed);
+
+    let utxos_after = btc_regtest_controller.get_all_utxos(&pubkey);
+
+    // last UTXO was spent, which would also have been the smallest.
+    let mut has_biggest = false;
+    for utxo in utxos_after.into_iter() {
+        assert_ne!(utxo, last_utxo);
+        assert_ne!(utxo, smallest_utxo);
+
+        // don't care about confirmations here
+        biggest_utxo.confirmations = utxo.confirmations;
+        if utxo == biggest_utxo {
+            has_biggest = true;
+        }
+    }
+
+    // biggest UTXO is *not* spent
+    assert!(has_biggest);
 
     channel.stop_chains_coordinator();
 }
@@ -900,6 +1068,7 @@ fn stx_transfer_btc_integration_test() {
         vout: 1,
         script_pub_key: pre_stx_tx.output[1].script_pubkey.clone(),
         amount: pre_stx_tx.output[1].value,
+        confirmations: 0,
     };
 
     // let's fire off our transfer op.
@@ -1143,7 +1312,125 @@ fn bitcoind_forking_test() {
     // but we're able to keep on mining
     assert_eq!(account.nonce, 3);
 
+    // Let's create another fork, deeper
+    let burn_header_hash_to_fork = btc_regtest_controller.get_block_hash(206);
+    btc_regtest_controller.invalidate_block(&burn_header_hash_to_fork);
+    btc_regtest_controller.build_next_block(10);
+
+    thread::sleep(Duration::from_secs(5));
+    next_block_and_wait(&mut btc_regtest_controller, &blocks_processed);
+
+    let account = get_account(&http_origin, &miner_account);
+    assert_eq!(account.balance, 0);
+    assert_eq!(account.nonce, 3);
+
+    next_block_and_wait(&mut btc_regtest_controller, &blocks_processed);
+
+    let account = get_account(&http_origin, &miner_account);
+    assert_eq!(account.balance, 0);
+    // but we're able to keep on mining
+    assert_eq!(account.nonce, 3);
+
     channel.stop_chains_coordinator();
+}
+
+#[test]
+#[ignore]
+fn should_fix_2771() {
+    if env::var("BITCOIND_TEST") != Ok("1".into()) {
+        return;
+    }
+
+    let (conf, _miner_account) = neon_integration_test_conf();
+
+    let mut btcd_controller = BitcoinCoreController::new(conf.clone());
+    btcd_controller
+        .start_bitcoind()
+        .map_err(|_e| ())
+        .expect("Failed starting bitcoind");
+
+    let mut btc_regtest_controller = BitcoinRegtestController::new(conf.clone(), None);
+
+    btc_regtest_controller.bootstrap_chain(201);
+
+    eprintln!("Chain bootstrapped...");
+
+    let mut run_loop = neon::RunLoop::new(conf);
+    let blocks_processed = run_loop.get_blocks_processed_arc();
+
+    let channel = run_loop.get_coordinator_channel().unwrap();
+
+    thread::spawn(move || run_loop.start(None, 0));
+
+    // give the run loop some time to start up!
+    wait_for_runloop(&blocks_processed);
+
+    // first block wakes up the run loop
+    next_block_and_wait(&mut btc_regtest_controller, &blocks_processed);
+
+    // first block will hold our VRF registration
+    next_block_and_wait(&mut btc_regtest_controller, &blocks_processed);
+
+    let mut sort_height = channel.get_sortitions_processed();
+    eprintln!("Sort height: {}", sort_height);
+
+    while sort_height < 210 {
+        next_block_and_wait(&mut btc_regtest_controller, &blocks_processed);
+        sort_height = channel.get_sortitions_processed();
+        eprintln!("Sort height: {}", sort_height);
+    }
+
+    // okay, let's figure out the burn block we want to fork away.
+    let reorg_height = 208;
+    warn!("Will trigger re-org at block {}", reorg_height);
+    let burn_header_hash_to_fork = btc_regtest_controller.get_block_hash(reorg_height);
+    btc_regtest_controller.invalidate_block(&burn_header_hash_to_fork);
+    btc_regtest_controller.build_next_block(1);
+    thread::sleep(Duration::from_secs(5));
+
+    // The test here consists in producing a canonical chain with 210 blocks.
+    // Once done, we invalidate the block 208, and instead of rebuilding directly
+    // a longer fork with N blocks (as done in the bitcoind_forking_test)
+    // we slowly add some more blocks.
+    // Without the patch, this behavior ends up crashing the node with errors like:
+    // WARN [1626791307.078061] [src/chainstate/coordinator/mod.rs:535] [chains-coordinator] ChainsCoordinator: could not retrieve  block burnhash=40bdbf0dda349642bdf4dd30dd31af4f0c9979ce12a7c17485245d0a6ddd970b
+    // WARN [1626791307.078098] [src/chainstate/coordinator/mod.rs:308] [chains-coordinator] Error processing new burn block: NonContiguousBurnchainBlock(UnknownBlock(40bdbf0dda349642bdf4dd30dd31af4f0c9979ce12a7c17485245d0a6ddd970b))
+    // And the burnchain db ends up in the same state we ended up while investigating 2771.
+    // With this patch, the node is able to entirely register this new canonical fork, and then able to make progress and finish successfully.
+    for _i in 0..3 {
+        btc_regtest_controller.build_next_block(1);
+        thread::sleep(Duration::from_secs(30));
+    }
+
+    channel.stop_chains_coordinator();
+}
+
+/// Returns a StacksMicroblock with the given transactions, sequence, and parent block that is
+/// signed with the given private key.
+fn make_signed_microblock(
+    block_privk: &StacksPrivateKey,
+    txs: Vec<StacksTransaction>,
+    parent_block: BlockHeaderHash,
+    seq: u16,
+) -> StacksMicroblock {
+    let mut rng = rand::thread_rng();
+
+    let txid_vecs = txs.iter().map(|tx| tx.txid().as_bytes().to_vec()).collect();
+    let merkle_tree = MerkleTree::<Sha512Trunc256Sum>::new(&txid_vecs);
+    let tx_merkle_root = merkle_tree.root();
+
+    let mut mblock = StacksMicroblock {
+        header: StacksMicroblockHeader {
+            version: rng.gen(),
+            sequence: seq,
+            prev_block: parent_block,
+            tx_merkle_root: tx_merkle_root,
+            signature: MessageSignature([0u8; 65]),
+        },
+        txs: txs,
+    };
+    mblock.sign(block_privk).unwrap();
+    mblock
 }
 
 #[test]
@@ -1155,6 +1442,8 @@ fn microblock_integration_test() {
 
     let spender_sk = StacksPrivateKey::from_hex(SK_1).unwrap();
     let spender_addr: PrincipalData = to_addr(&spender_sk).into();
+    let second_spender_sk = StacksPrivateKey::from_hex(SK_2).unwrap();
+    let second_spender_addr: PrincipalData = to_addr(&second_spender_sk).into();
 
     let (mut conf, miner_account) = neon_integration_test_conf();
 
@@ -1162,10 +1451,14 @@ fn microblock_integration_test() {
         address: spender_addr.clone(),
         amount: 100300,
     });
+    conf.initial_balances.push(InitialBalance {
+        address: second_spender_addr.clone(),
+        amount: 10000,
+    });
 
     conf.node.mine_microblocks = true;
-    conf.node.wait_time_for_microblocks = 30000;
-    conf.node.microblock_frequency = 5_000;
+    conf.node.wait_time_for_microblocks = 10_000;
+    conf.node.microblock_frequency = 1_000;
 
     test_observer::spawn();
 
@@ -1208,15 +1501,19 @@ fn microblock_integration_test() {
     next_block_and_wait(&mut btc_regtest_controller, &blocks_processed);
 
     // let's query the miner's account nonce:
-
     info!("Miner account: {}", miner_account);
     let account = get_account(&http_origin, &miner_account);
     assert_eq!(account.balance, 0);
     assert_eq!(account.nonce, 1);
 
-    // and our spender
+    // and our first spender
     let account = get_account(&http_origin, &spender_addr);
     assert_eq!(account.balance, 100300);
+    assert_eq!(account.nonce, 0);
+
+    // and our second spender
+    let account = get_account(&http_origin, &second_spender_addr);
+    assert_eq!(account.balance, 10000);
     assert_eq!(account.nonce, 0);
 
     // okay, let's push a transaction that is marked microblock only!
@@ -1245,18 +1542,31 @@ fn microblock_integration_test() {
     let account = get_account(&http_origin, &spender_addr);
     assert_eq!(account.nonce, 1);
 
-    // push another transaction that is marked microblock only
+    // push another two transactions that are marked microblock only
     let recipient = StacksAddress::from_string(ADDR_4).unwrap();
     let unconfirmed_tx_bytes =
         make_stacks_transfer_mblock_only(&spender_sk, 1, 1000, &recipient.into(), 1000);
     let unconfirmed_tx =
         StacksTransaction::consensus_deserialize(&mut &unconfirmed_tx_bytes[..]).unwrap();
+    let second_unconfirmed_tx_bytes =
+        make_stacks_transfer_mblock_only(&second_spender_sk, 0, 1000, &recipient.into(), 1500);
+    let second_unconfirmed_tx =
+        StacksTransaction::consensus_deserialize(&mut &second_unconfirmed_tx_bytes[..]).unwrap();
 
     // TODO (hack) instantiate the sortdb in the burnchain
     let _ = btc_regtest_controller.sortdb_mut();
 
-    // put it into a microblock
-    let microblock = {
+    // put each into a microblock
+    let (first_microblock, second_microblock) = {
+        let path = format!("{}/v2/info", &http_origin);
+        let tip_info = client
+            .get(&path)
+            .send()
+            .unwrap()
+            .json::<RPCPeerInfoData>()
+            .unwrap();
+        let stacks_tip = tip_info.stacks_tip;
+
         let (consensus_hash, stacks_block) = get_tip_anchored_block(&conf);
         let tip_hash =
             StacksBlockHeader::make_index_block_hash(&consensus_hash, &stacks_block.block_hash());
@@ -1270,23 +1580,27 @@ fn microblock_integration_test() {
         chainstate
             .reload_unconfirmed_state(&btc_regtest_controller.sortdb_ref().index_conn(), tip_hash)
             .unwrap();
-
-        make_microblock(
+        let first_microblock = make_microblock(
             &privk,
             &mut chainstate,
             &btc_regtest_controller.sortdb_ref().index_conn(),
             consensus_hash,
-            stacks_block,
+            stacks_block.clone(),
             vec![unconfirmed_tx],
-        )
+        );
+
+        let second_microblock =
+            make_signed_microblock(&privk, vec![second_unconfirmed_tx], stacks_tip, 1);
+
+        (first_microblock, second_microblock)
     };
 
     let mut microblock_bytes = vec![];
-    microblock
+    first_microblock
         .consensus_serialize(&mut microblock_bytes)
         .unwrap();
 
-    // post it
+    // post the first microblock
     let path = format!("{}/v2/microblocks", &http_origin);
     let res: String = client
         .post(&path)
@@ -1297,33 +1611,131 @@ fn microblock_integration_test() {
         .json()
         .unwrap();
 
-    assert_eq!(res, format!("{}", &microblock.block_hash()));
+    assert_eq!(res, format!("{}", &first_microblock.block_hash()));
 
-    eprintln!("\n\nBegin testing\nmicroblock: {:?}\n\n", &microblock);
+    eprintln!("\n\nBegin testing\nmicroblock: {:?}\n\n", &first_microblock);
 
     let account = get_account(&http_origin, &spender_addr);
     assert_eq!(account.nonce, 1);
     assert_eq!(account.balance, 98300);
 
-    let path = format!("{}/v2/info", &http_origin);
-    let tip_info = client
-        .get(&path)
+    let mut second_microblock_bytes = vec![];
+    second_microblock
+        .consensus_serialize(&mut second_microblock_bytes)
+        .unwrap();
+
+    // post the second microblock
+    let path = format!("{}/v2/microblocks", &http_origin);
+    let res: String = client
+        .post(&path)
+        .header("Content-Type", "application/octet-stream")
+        .body(second_microblock_bytes.clone())
         .send()
         .unwrap()
-        .json::<RPCPeerInfoData>()
+        .json()
         .unwrap();
-    assert!(tip_info.stacks_tip_height >= 3);
 
-    eprintln!(
-        "{:#?}",
-        client
+    assert_eq!(res, format!("{}", &second_microblock.block_hash()));
+
+    sleep_ms(5_000);
+
+    let path = format!("{}/v2/info", &http_origin);
+    let mut iter_count = 0;
+    let tip_info = loop {
+        let tip_info = client
             .get(&path)
             .send()
             .unwrap()
-            .json::<serde_json::Value>()
-            .unwrap()
-    );
+            .json::<RPCPeerInfoData>()
+            .unwrap();
+        eprintln!("{:#?}", tip_info);
+        if tip_info.unanchored_tip == StacksBlockId([0; 32]) {
+            iter_count += 1;
+            assert!(
+                iter_count < 10,
+                "Hit retry count while waiting for net module to process pushed microblock"
+            );
+            sleep_ms(5_000);
+            continue;
+        } else {
+            break tip_info;
+        }
+    };
 
+    assert!(tip_info.stacks_tip_height >= 3);
+    let stacks_tip = tip_info.stacks_tip;
+    let stacks_tip_consensus_hash = tip_info.stacks_tip_consensus_hash;
+    let stacks_id_tip =
+        StacksBlockHeader::make_index_block_hash(&stacks_tip_consensus_hash, &stacks_tip);
+
+    // todo - pipe in the PoxSyncWatchdog to the RunLoop struct to avoid flakiness here
+    // wait at least two p2p refreshes so it can produce the microblock
+    for i in 0..30 {
+        info!(
+            "wait {} more seconds for microblock miner to find our transaction...",
+            30 - i
+        );
+        sleep_ms(1000);
+    }
+
+    // check event observer for new microblock event (expect at least 2)
+    let mut microblock_events = test_observer::get_microblocks();
+    assert!(microblock_events.len() >= 2);
+
+    // this microblock should correspond to `second_microblock`
+    let microblock = microblock_events.pop().unwrap();
+    let transactions = microblock.get("transactions").unwrap().as_array().unwrap();
+    assert_eq!(transactions.len(), 1);
+    let tx_sequence = transactions[0]
+        .get("microblock_sequence")
+        .unwrap()
+        .as_u64()
+        .unwrap();
+    assert_eq!(tx_sequence, 1);
+    let microblock_hash = transactions[0]
+        .get("microblock_hash")
+        .unwrap()
+        .as_str()
+        .unwrap();
+    assert_eq!(
+        microblock_hash[2..],
+        format!("{}", second_microblock.header.block_hash())
+    );
+    let microblock_associated_hash = microblock
+        .get("parent_index_block_hash")
+        .unwrap()
+        .as_str()
+        .unwrap();
+    let index_block_hash_bytes = hex_bytes(&microblock_associated_hash[2..]).unwrap();
+    assert_eq!(
+        StacksBlockId::from_vec(&index_block_hash_bytes),
+        Some(stacks_id_tip)
+    );
+    // make sure we have stats for the burn block
+    let _burn_block_hash = microblock.get("burn_block_hash").unwrap().as_str().unwrap();
+    let _burn_block_height = microblock
+        .get("burn_block_height")
+        .unwrap()
+        .as_u64()
+        .unwrap();
+    let _burn_block_timestamp = microblock
+        .get("burn_block_timestamp")
+        .unwrap()
+        .as_u64()
+        .unwrap();
+
+    // this microblock should correspond to the first microblock that was posted
+    let microblock = microblock_events.pop().unwrap();
+    let transactions = microblock.get("transactions").unwrap().as_array().unwrap();
+    assert_eq!(transactions.len(), 1);
+    let tx_sequence = transactions[0]
+        .get("microblock_sequence")
+        .unwrap()
+        .as_u64()
+        .unwrap();
+    assert_eq!(tx_sequence, 0);
+
+    // check mempool tx events
     let memtx_events = test_observer::get_memtxs();
     assert_eq!(memtx_events.len(), 1);
     assert_eq!(&memtx_events[0], &format!("0x{}", &bytes_to_hex(&tx)));
@@ -1378,6 +1790,25 @@ fn microblock_integration_test() {
 
         let _miner_txid = block.get("miner_txid").unwrap().as_str().unwrap();
 
+        // make sure we have stats for the previous burn block
+        let _parent_burn_block_hash = block
+            .get("parent_burn_block_hash")
+            .unwrap()
+            .as_str()
+            .unwrap();
+
+        let _parent_burn_block_height = block
+            .get("parent_burn_block_height")
+            .unwrap()
+            .as_u64()
+            .unwrap();
+
+        let _parent_burn_block_timestamp = block
+            .get("parent_burn_block_timestamp")
+            .unwrap()
+            .as_u64()
+            .unwrap();
+
         prior = Some(my_index_hash);
     }
 
@@ -1386,27 +1817,28 @@ fn microblock_integration_test() {
         "{}/v2/accounts/{}?proof=0&tip={}",
         &http_origin, &spender_addr, &tip_info.unanchored_tip
     );
+
     eprintln!("{:?}", &path);
 
+    let mut iter_count = 0;
     let res = loop {
-        let res = match client
-            .get(&path)
-            .send()
-            .unwrap()
-            .json::<AccountEntryResponse>()
-        {
-            Ok(x) => x,
-            Err(_) => {
-                eprintln!("Failed to query {}; will try again", &path);
+        let http_resp = client.get(&path).send().unwrap();
+
+        info!("{:?}", http_resp);
+
+        match http_resp.json::<AccountEntryResponse>() {
+            Ok(x) => break x,
+            Err(e) => {
+                warn!("Failed to query {}; will try again. Err = {:?}", &path, e);
+                iter_count += 1;
+                assert!(iter_count < 10, "Retry limit reached querying account");
                 sleep_ms(1000);
                 continue;
             }
         };
-
-        break res;
     };
 
-    eprintln!("{:#?}", res);
+    info!("Account Response = {:#?}", res);
     assert_eq!(res.nonce, 2);
     assert_eq!(u128::from_str_radix(&res.balance[2..], 16).unwrap(), 96300);
 
@@ -1462,6 +1894,7 @@ fn microblock_integration_test() {
             "{}/v2/accounts/{}?proof=0&tip={}",
             &http_origin, &spender_addr, &tip_info.unanchored_tip
         );
+
         let res_text = client.get(&path).send().unwrap().text().unwrap();
 
         eprintln!("text of {}\n{}", &path, &res_text);
@@ -1489,14 +1922,330 @@ fn microblock_integration_test() {
 
 #[test]
 #[ignore]
+fn filter_low_fee_tx_integration_test() {
+    if env::var("BITCOIND_TEST") != Ok("1".into()) {
+        return;
+    }
+
+    let spender_sks: Vec<_> = (0..10)
+        .into_iter()
+        .map(|_| StacksPrivateKey::new())
+        .collect();
+    let spender_addrs: Vec<PrincipalData> = spender_sks.iter().map(|x| to_addr(x).into()).collect();
+
+    let txs: Vec<_> = spender_sks
+        .iter()
+        .enumerate()
+        .map(|(ix, spender_sk)| {
+            let recipient = StacksAddress::from_string(ADDR_4).unwrap();
+
+            if ix < 5 {
+                // low-fee
+                make_stacks_transfer(&spender_sk, 0, 1000 + (ix as u64), &recipient.into(), 1000)
+            } else {
+                // high-fee
+                make_stacks_transfer(&spender_sk, 0, 2000 + (ix as u64), &recipient.into(), 1000)
+            }
+        })
+        .collect();
+
+    let (mut conf, _) = neon_integration_test_conf();
+    for spender_addr in spender_addrs.iter() {
+        conf.initial_balances.push(InitialBalance {
+            address: spender_addr.clone(),
+            amount: 1049230,
+        });
+    }
+
+    // exclude the first 5 transactions from miner consideration
+    conf.miner.min_tx_fee = 1500;
+
+    let mut btcd_controller = BitcoinCoreController::new(conf.clone());
+    btcd_controller
+        .start_bitcoind()
+        .map_err(|_e| ())
+        .expect("Failed starting bitcoind");
+
+    let mut btc_regtest_controller = BitcoinRegtestController::new(conf.clone(), None);
+    let http_origin = format!("http://{}", &conf.node.rpc_bind);
+
+    btc_regtest_controller.bootstrap_chain(201);
+
+    eprintln!("Chain bootstrapped...");
+
+    let mut run_loop = neon::RunLoop::new(conf);
+    let blocks_processed = run_loop.get_blocks_processed_arc();
+
+    let channel = run_loop.get_coordinator_channel().unwrap();
+
+    thread::spawn(move || run_loop.start(None, 0));
+
+    // give the run loop some time to start up!
+    wait_for_runloop(&blocks_processed);
+
+    // first block wakes up the run loop
+    next_block_and_wait(&mut btc_regtest_controller, &blocks_processed);
+
+    // first block will hold our VRF registration
+    next_block_and_wait(&mut btc_regtest_controller, &blocks_processed);
+
+    // second block will be the first mined Stacks block
+    next_block_and_wait(&mut btc_regtest_controller, &blocks_processed);
+
+    for tx in txs.iter() {
+        submit_tx(&http_origin, tx);
+    }
+
+    // mine a couple more blocks
+    next_block_and_wait(&mut btc_regtest_controller, &blocks_processed);
+    next_block_and_wait(&mut btc_regtest_controller, &blocks_processed);
+    next_block_and_wait(&mut btc_regtest_controller, &blocks_processed);
+
+    // first five accounts are blank
+    for i in 0..5 {
+        let account = get_account(&http_origin, &spender_addrs[i]);
+        assert_eq!(account.nonce, 0);
+    }
+
+    // last five accounts have traction
+    for i in 5..10 {
+        let account = get_account(&http_origin, &spender_addrs[i]);
+        assert_eq!(account.nonce, 1);
+    }
+
+    channel.stop_chains_coordinator();
+}
+
+#[test]
+#[ignore]
+fn filter_long_runtime_tx_integration_test() {
+    if env::var("BITCOIND_TEST") != Ok("1".into()) {
+        return;
+    }
+
+    let spender_sks: Vec<_> = (0..10)
+        .into_iter()
+        .map(|_| StacksPrivateKey::new())
+        .collect();
+    let spender_addrs: Vec<PrincipalData> = spender_sks.iter().map(|x| to_addr(x).into()).collect();
+
+    let txs: Vec<_> = spender_sks
+        .iter()
+        .enumerate()
+        .map(|(ix, spender_sk)| {
+            let recipient = StacksAddress::from_string(ADDR_4).unwrap();
+            make_stacks_transfer(&spender_sk, 0, 1000 + (ix as u64), &recipient.into(), 1000)
+        })
+        .collect();
+
+    let (mut conf, _) = neon_integration_test_conf();
+    for spender_addr in spender_addrs.iter() {
+        conf.initial_balances.push(InitialBalance {
+            address: spender_addr.clone(),
+            amount: 1049230,
+        });
+    }
+
+    // all transactions have high-enough fees...
+    conf.miner.min_tx_fee = 1;
+
+    // ...but none of them will be mined since we allot zero ms to do so
+    conf.miner.first_attempt_time_ms = 0;
+    conf.miner.subsequent_attempt_time_ms = 0;
+
+    let mut btcd_controller = BitcoinCoreController::new(conf.clone());
+    btcd_controller
+        .start_bitcoind()
+        .map_err(|_e| ())
+        .expect("Failed starting bitcoind");
+
+    let mut btc_regtest_controller = BitcoinRegtestController::new(conf.clone(), None);
+    let http_origin = format!("http://{}", &conf.node.rpc_bind);
+
+    btc_regtest_controller.bootstrap_chain(201);
+
+    eprintln!("Chain bootstrapped...");
+
+    let mut run_loop = neon::RunLoop::new(conf);
+    let blocks_processed = run_loop.get_blocks_processed_arc();
+
+    let channel = run_loop.get_coordinator_channel().unwrap();
+
+    thread::spawn(move || run_loop.start(None, 0));
+
+    // give the run loop some time to start up!
+    wait_for_runloop(&blocks_processed);
+
+    // first block wakes up the run loop
+    next_block_and_wait(&mut btc_regtest_controller, &blocks_processed);
+
+    // first block will hold our VRF registration
+    next_block_and_wait(&mut btc_regtest_controller, &blocks_processed);
+
+    // second block will be the first mined Stacks block
+    next_block_and_wait(&mut btc_regtest_controller, &blocks_processed);
+
+    for tx in txs.iter() {
+        submit_tx(&http_origin, tx);
+    }
+
+    // mine a couple more blocks
+    next_block_and_wait(&mut btc_regtest_controller, &blocks_processed);
+    next_block_and_wait(&mut btc_regtest_controller, &blocks_processed);
+    next_block_and_wait(&mut btc_regtest_controller, &blocks_processed);
+
+    // no transactions mined
+    for i in 0..10 {
+        let account = get_account(&http_origin, &spender_addrs[i]);
+        assert_eq!(account.nonce, 0);
+    }
+
+    channel.stop_chains_coordinator();
+}
+
+#[test]
+#[ignore]
+fn mining_transactions_is_fair() {
+    // test that origin addresses with higher-than-min-fee transactions pending will get considered
+    // in a round-robin fashion, even if one origin has waaaaaay more outstanding transactions than
+    // the other (and with higher fees).
+    if env::var("BITCOIND_TEST") != Ok("1".into()) {
+        return;
+    }
+
+    let spender_sks: Vec<_> = (0..2)
+        .into_iter()
+        .map(|_| StacksPrivateKey::new())
+        .collect();
+    let spender_addrs: Vec<PrincipalData> = spender_sks.iter().map(|x| to_addr(x).into()).collect();
+
+    let mut txs = vec![];
+    let recipient = StacksAddress::from_string(ADDR_4).unwrap();
+
+    // spender 0 sends 20 txs, at over 2000 uSTX tx fee
+    for i in 0..20 {
+        let tx = make_stacks_transfer(
+            &spender_sks[0],
+            i,
+            2000 + (i as u64),
+            &recipient.into(),
+            1000,
+        );
+        txs.push(tx);
+    }
+
+    // spender 1 sends 1 tx
+    let tx = make_stacks_transfer(&spender_sks[1], 0, 1000, &recipient.into(), 1000);
+    txs.push(tx);
+
+    let (mut conf, _) = neon_integration_test_conf();
+    for spender_addr in spender_addrs.iter() {
+        conf.initial_balances.push(InitialBalance {
+            address: spender_addr.clone(),
+            amount: 1049230,
+        });
+    }
+
+    // all transactions have high-enough fees...
+    conf.miner.min_tx_fee = 1;
+    conf.miner.first_attempt_time_ms = u64::max_value();
+    conf.miner.subsequent_attempt_time_ms = u64::max_value();
+
+    test_observer::spawn();
+    conf.events_observers.push(EventObserverConfig {
+        endpoint: format!("localhost:{}", test_observer::EVENT_OBSERVER_PORT),
+        events_keys: vec![EventKeyType::AnyEvent],
+    });
+
+    let mut btcd_controller = BitcoinCoreController::new(conf.clone());
+    btcd_controller
+        .start_bitcoind()
+        .map_err(|_e| ())
+        .expect("Failed starting bitcoind");
+
+    let mut btc_regtest_controller = BitcoinRegtestController::new(conf.clone(), None);
+    let http_origin = format!("http://{}", &conf.node.rpc_bind);
+
+    btc_regtest_controller.bootstrap_chain(201);
+
+    eprintln!("Chain bootstrapped...");
+
+    let mut run_loop = neon::RunLoop::new(conf);
+    let blocks_processed = run_loop.get_blocks_processed_arc();
+
+    let channel = run_loop.get_coordinator_channel().unwrap();
+
+    thread::spawn(move || run_loop.start(None, 0));
+
+    // give the run loop some time to start up!
+    wait_for_runloop(&blocks_processed);
+
+    // first block wakes up the run loop
+    next_block_and_wait(&mut btc_regtest_controller, &blocks_processed);
+
+    // first block will hold our VRF registration
+    next_block_and_wait(&mut btc_regtest_controller, &blocks_processed);
+
+    // second block will be the first mined Stacks block
+    next_block_and_wait(&mut btc_regtest_controller, &blocks_processed);
+
+    for tx in txs.iter() {
+        submit_tx(&http_origin, tx);
+    }
+
+    // mine a couple more blocks -- all 21 transactions should get mined; the same origin should be
+    // considered more than once per block, but all origins should be considered
+    next_block_and_wait(&mut btc_regtest_controller, &blocks_processed);
+    next_block_and_wait(&mut btc_regtest_controller, &blocks_processed);
+    next_block_and_wait(&mut btc_regtest_controller, &blocks_processed);
+
+    // the lower-fee origin should *not* be the last transaction added
+    let blocks = test_observer::get_blocks();
+
+    let mut found_sender_1 = false;
+    let mut sender_1_is_last = true;
+
+    for block in blocks.iter() {
+        let transactions = block.get("transactions").unwrap().as_array().unwrap();
+        for tx in transactions.iter() {
+            let raw_tx = tx.get("raw_tx").unwrap().as_str().unwrap();
+            if raw_tx == "0x00" {
+                continue;
+            }
+            let tx_bytes = hex_bytes(&raw_tx[2..]).unwrap();
+            let parsed = StacksTransaction::consensus_deserialize(&mut &tx_bytes[..]).unwrap();
+            if let TransactionPayload::TokenTransfer(..) = parsed.payload {
+                if parsed.auth().origin().address_testnet() == to_addr(&spender_sks[1]) {
+                    found_sender_1 = true;
+                } else if found_sender_1 {
+                    // some tx from sender 0 got mined after the one from sender 1, which is what
+                    // we want -- sender 1 shouldn't monopolize mempool consideration
+                    sender_1_is_last = false;
+                }
+            }
+        }
+    }
+
+    assert!(found_sender_1);
+    assert!(!sender_1_is_last);
+
+    // all transactions mined
+    let account_0 = get_account(&http_origin, &spender_addrs[0]);
+    assert_eq!(account_0.nonce, 20);
+
+    let account_1 = get_account(&http_origin, &spender_addrs[1]);
+    assert_eq!(account_1.nonce, 1);
+
+    channel.stop_chains_coordinator();
+}
+
+#[test]
+#[ignore]
 fn size_check_integration_test() {
     if env::var("BITCOIND_TEST") != Ok("1".into()) {
         return;
     }
 
-    // used to specify how long to wait in between blocks.
-    //   we could _probably_ add a hook to the neon node that
-    //   would remove some of the need for this
     let mut giant_contract = "(define-public (f) (ok 1))".to_string();
     for _i in 0..(1024 * 1024 + 500) {
         giant_contract.push_str(" ");
@@ -1507,6 +2256,7 @@ fn size_check_integration_test() {
         .map(|_| StacksPrivateKey::new())
         .collect();
     let spender_addrs: Vec<PrincipalData> = spender_sks.iter().map(|x| to_addr(x).into()).collect();
+
     // make a bunch of txs that will only fit one per block.
     let txs: Vec<_> = spender_sks
         .iter()
@@ -1540,7 +2290,11 @@ fn size_check_integration_test() {
 
     conf.node.mine_microblocks = true;
     conf.node.wait_time_for_microblocks = 5000;
-    conf.node.microblock_frequency = 15000;
+    conf.node.microblock_frequency = 1000;
+
+    conf.miner.min_tx_fee = 1;
+    conf.miner.first_attempt_time_ms = i64::max_value() as u64;
+    conf.miner.subsequent_attempt_time_ms = i64::max_value() as u64;
 
     let mut btcd_controller = BitcoinCoreController::new(conf.clone());
     btcd_controller
@@ -1591,48 +2345,54 @@ fn size_check_integration_test() {
         submit_tx(&http_origin, tx);
     }
 
-    sleep_ms(75_000);
-
-    // now let's mine a couple blocks, and then check the sender's nonce.
-    //  at the end of mining three blocks, there should be _two_ transactions from the microblock
-    //  only set that got mined (since the block before this one was empty, a microblock can
-    //  be added),
-    //  and _two_ transactions from the two anchor blocks that got mined (and processed)
-    //
-    // this one wakes up our node, so that it'll mine a microblock _and_ an anchor block.
-    next_block_and_wait(&mut btc_regtest_controller, &blocks_processed);
-    // this one will contain the sortition from above anchor block,
-    //    which *should* have also confirmed the microblock.
-    sleep_ms(75_000);
-
-    next_block_and_wait(&mut btc_regtest_controller, &blocks_processed);
-
-    // let's figure out how many micro-only and anchor-only txs got accepted
-    //   by examining our account nonces:
     let mut micro_block_txs = 0;
     let mut anchor_block_txs = 0;
-    for (ix, spender_addr) in spender_addrs.iter().enumerate() {
-        let res = get_account(&http_origin, &spender_addr);
-        if res.nonce == 1 {
-            if ix % 2 == 0 {
-                anchor_block_txs += 1;
-            } else {
-                micro_block_txs += 1;
+
+    for i in 0..100 {
+        // now let's mine a couple blocks, and then check the sender's nonce.
+        //  at the end of mining three blocks, there should be _at least one_ transaction from the microblock
+        //  only set that got mined (since the block before this one was empty, a microblock can
+        //  be added),
+        //  and a number of transactions from equal to the number anchor blocks will get mined.
+        //
+        // this one wakes up our node, so that it'll mine a microblock _and_ an anchor block.
+        next_block_and_wait(&mut btc_regtest_controller, &blocks_processed);
+        // this one will contain the sortition from above anchor block,
+        //    which *should* have also confirmed the microblock.
+        sleep_ms(10_000 * i);
+
+        micro_block_txs = 0;
+        anchor_block_txs = 0;
+
+        // let's figure out how many micro-only and anchor-only txs got accepted
+        //   by examining our account nonces:
+        for (ix, spender_addr) in spender_addrs.iter().enumerate() {
+            let res = get_account(&http_origin, &spender_addr);
+            if res.nonce == 1 {
+                if ix % 2 == 0 {
+                    anchor_block_txs += 1;
+                } else {
+                    micro_block_txs += 1;
+                }
+            } else if res.nonce != 0 {
+                panic!("Spender address nonce incremented past 1");
             }
-        } else if res.nonce != 0 {
-            panic!("Spender address nonce incremented past 1");
+
+            debug!("Spender {},{}: {:?}", ix, &spender_addr, &res);
         }
 
-        debug!("Spender {},{}: {:?}", ix, &spender_addr, &res);
+        eprintln!(
+            "anchor_block_txs: {}, micro_block_txs: {}",
+            anchor_block_txs, micro_block_txs
+        );
+
+        if anchor_block_txs >= 2 && micro_block_txs >= 2 {
+            break;
+        }
     }
 
-    eprintln!(
-        "anchor_block_txs: {}, micro_block_txs: {}",
-        anchor_block_txs, micro_block_txs
-    );
-
-    assert_eq!(anchor_block_txs, 2);
-    assert_eq!(micro_block_txs, 2);
+    assert!(anchor_block_txs >= 2);
+    assert!(micro_block_txs >= 2);
 
     test_observer::clear();
     channel.stop_chains_coordinator();
@@ -1659,7 +2419,7 @@ fn size_overflow_unconfirmed_microblocks_integration_test() {
         small_contract.push_str(" ");
     }
 
-    let spender_sks: Vec<_> = (0..10)
+    let spender_sks: Vec<_> = (0..5)
         .into_iter()
         .map(|_| StacksPrivateKey::new())
         .collect();
@@ -1705,8 +2465,12 @@ fn size_overflow_unconfirmed_microblocks_integration_test() {
     }
 
     conf.node.mine_microblocks = true;
-    conf.node.wait_time_for_microblocks = 5000;
-    conf.node.microblock_frequency = 15000;
+    conf.node.wait_time_for_microblocks = 5_000;
+    conf.node.microblock_frequency = 5_000;
+
+    conf.miner.min_tx_fee = 1;
+    conf.miner.first_attempt_time_ms = i64::max_value() as u64;
+    conf.miner.subsequent_attempt_time_ms = i64::max_value() as u64;
 
     test_observer::spawn();
     conf.events_observers.push(EventObserverConfig {
@@ -1729,6 +2493,7 @@ fn size_overflow_unconfirmed_microblocks_integration_test() {
 
     let mut run_loop = neon::RunLoop::new(conf);
     let blocks_processed = run_loop.get_blocks_processed_arc();
+    let microblocks_processed = run_loop.get_microblocks_processed_arc();
 
     let channel = run_loop.get_coordinator_channel().unwrap();
 
@@ -1765,7 +2530,9 @@ fn size_overflow_unconfirmed_microblocks_integration_test() {
         }
     }
 
-    sleep_ms(150_000);
+    while wait_for_microblocks(&microblocks_processed, 120) {
+        info!("Waiting for microblocks to no longer be processed");
+    }
 
     // now let's mine a couple blocks, and then check the sender's nonce.
     //  at the end of mining three blocks, there should be _two_ transactions from the microblock
@@ -1777,9 +2544,14 @@ fn size_overflow_unconfirmed_microblocks_integration_test() {
     next_block_and_wait(&mut btc_regtest_controller, &blocks_processed);
     // this one will contain the sortition from above anchor block,
     //    which *should* have also confirmed the microblock.
-    sleep_ms(150_000);
+
+    while wait_for_microblocks(&microblocks_processed, 120) {
+        info!("Waiting for microblocks to no longer be processed");
+    }
 
     next_block_and_wait(&mut btc_regtest_controller, &blocks_processed);
+
+    sleep_ms(30_000);
 
     let blocks = test_observer::get_blocks();
     assert_eq!(blocks.len(), 3);
@@ -1807,7 +2579,7 @@ fn size_overflow_unconfirmed_microblocks_integration_test() {
                 if tsc.name.to_string().find("large-").is_some() {
                     num_big_anchored_txs += 1;
                     total_big_txs_per_block += 1;
-                } else if tsc.name.to_string().find("small-").is_some() {
+                } else if tsc.name.to_string().find("small").is_some() {
                     num_big_microblock_txs += 1;
                     total_big_txs_per_microblock += 1;
                 }
@@ -1857,31 +2629,25 @@ fn size_overflow_unconfirmed_stream_microblocks_integration_test() {
         small_contract.push_str(" ");
     }
 
-    let spender_sks: Vec<_> = (0..25)
+    let spender_sks: Vec<_> = (0..20)
         .into_iter()
         .map(|_| StacksPrivateKey::new())
         .collect();
     let spender_addrs: Vec<PrincipalData> = spender_sks.iter().map(|x| to_addr(x).into()).collect();
 
-    let txs: Vec<Vec<_>> = spender_sks
+    let txs: Vec<_> = spender_sks
         .iter()
         .map(|spender_sk| {
-            let mut ret = vec![];
-            for i in 0..1 {
-                let tx = make_contract_publish_microblock_only(
-                    spender_sk,
-                    i as u64,
-                    600000,
-                    &format!("small-{}", i),
-                    &small_contract,
-                );
-                ret.push(tx);
-            }
-            ret
+            let tx = make_contract_publish_microblock_only(
+                spender_sk,
+                0,
+                600000,
+                "small",
+                &small_contract,
+            );
+            tx
         })
         .collect();
-
-    let flat_txs: Vec<_> = txs.iter().flat_map(|a| a.clone()).collect();
 
     let (mut conf, miner_account) = neon_integration_test_conf();
 
@@ -1897,6 +2663,10 @@ fn size_overflow_unconfirmed_stream_microblocks_integration_test() {
     conf.node.microblock_frequency = 1000;
     conf.node.max_microblocks = 65536;
     conf.burnchain.max_rbf = 1000000;
+
+    conf.miner.min_tx_fee = 1;
+    conf.miner.first_attempt_time_ms = i64::max_value() as u64;
+    conf.miner.subsequent_attempt_time_ms = i64::max_value() as u64;
 
     test_observer::spawn();
     conf.events_observers.push(EventObserverConfig {
@@ -1949,9 +2719,10 @@ fn size_overflow_unconfirmed_stream_microblocks_integration_test() {
     }
 
     let mut ctr = 0;
-    while ctr < flat_txs.len() {
-        submit_tx(&http_origin, &flat_txs[ctr]);
-        if !wait_for_microblocks(&microblocks_processed, 240) {
+    while ctr < txs.len() {
+        submit_tx(&http_origin, &txs[ctr]);
+        if !wait_for_microblocks(&microblocks_processed, 60) {
+            // we time out if we *can't* mine any more microblocks
             break;
         }
         ctr += 1;
@@ -1967,27 +2738,27 @@ fn size_overflow_unconfirmed_stream_microblocks_integration_test() {
 
     microblocks_processed.store(0, Ordering::SeqCst);
 
-    while ctr < flat_txs.len() {
-        submit_tx(&http_origin, &flat_txs[ctr]);
-        if !wait_for_microblocks(&microblocks_processed, 240) {
-            break;
-        }
+    while ctr < txs.len() {
+        submit_tx(&http_origin, &txs[ctr]);
         ctr += 1;
     }
-
-    // should be able to fit 5 more transactions in, in 5 microblocks
-    assert_eq!(ctr, 10);
-    sleep_ms(5_000);
+    wait_for_microblocks(&microblocks_processed, 60);
 
     next_block_and_wait(&mut btc_regtest_controller, &blocks_processed);
 
     eprintln!("Second confirmed microblock stream!");
 
+    wait_for_microblocks(&microblocks_processed, 60);
+
     // confirm it
+    next_block_and_wait(&mut btc_regtest_controller, &blocks_processed);
+    next_block_and_wait(&mut btc_regtest_controller, &blocks_processed);
+
+    // this test can sometimes miss a mine block event.
     next_block_and_wait(&mut btc_regtest_controller, &blocks_processed);
 
     let blocks = test_observer::get_blocks();
-    assert_eq!(blocks.len(), 4);
+    assert!(blocks.len() >= 5, "Should have produced at least 5 blocks");
 
     let mut max_big_txs_per_microblock = 0;
     let mut total_big_txs_per_microblock = 0;
@@ -2007,7 +2778,7 @@ fn size_overflow_unconfirmed_stream_microblocks_integration_test() {
             let tx_bytes = hex_bytes(&raw_tx[2..]).unwrap();
             let parsed = StacksTransaction::consensus_deserialize(&mut &tx_bytes[..]).unwrap();
             if let TransactionPayload::SmartContract(tsc) = parsed.payload {
-                if tsc.name.to_string().find("small-").is_some() {
+                if tsc.name.to_string().find("small").is_some() {
                     num_big_microblock_txs += 1;
                     total_big_txs_per_microblock += 1;
                 }
@@ -2057,25 +2828,16 @@ fn size_overflow_unconfirmed_invalid_stream_microblocks_integration_test() {
     let txs: Vec<Vec<_>> = spender_sks
         .iter()
         .map(|spender_sk| {
-            let mut ret = vec![];
-            for i in 0..1 {
-                let tx = make_contract_publish_microblock_only(
-                    spender_sk,
-                    i as u64,
-                    1149230,
-                    &format!("small-{}", i),
-                    &small_contract,
-                );
-                ret.push(tx);
-            }
-            ret
+            let tx = make_contract_publish_microblock_only(
+                spender_sk,
+                0,
+                1149230,
+                "small",
+                &small_contract,
+            );
+            tx
         })
         .collect();
-
-    let flat_txs: Vec<_> = txs.iter().fold(vec![], |mut acc, a| {
-        acc.append(&mut a.clone());
-        acc
-    });
 
     let (mut conf, miner_account) = neon_integration_test_conf();
 
@@ -2087,11 +2849,15 @@ fn size_overflow_unconfirmed_invalid_stream_microblocks_integration_test() {
     }
 
     conf.node.mine_microblocks = true;
-    conf.node.wait_time_for_microblocks = 15000;
-    conf.node.microblock_frequency = 1000;
+    conf.node.wait_time_for_microblocks = 5_000;
+    conf.node.microblock_frequency = 1_000;
     conf.node.max_microblocks = 65536;
     conf.burnchain.max_rbf = 1000000;
     conf.block_limit = BLOCK_LIMIT_MAINNET.clone();
+
+    conf.miner.min_tx_fee = 1;
+    conf.miner.first_attempt_time_ms = i64::max_value() as u64;
+    conf.miner.subsequent_attempt_time_ms = i64::max_value() as u64;
 
     test_observer::spawn();
     conf.events_observers.push(EventObserverConfig {
@@ -2144,9 +2910,9 @@ fn size_overflow_unconfirmed_invalid_stream_microblocks_integration_test() {
     }
 
     let mut ctr = 0;
-    for i in 0..6 {
-        submit_tx(&http_origin, &flat_txs[ctr]);
-        if !wait_for_microblocks(&microblocks_processed, 240) {
+    for _i in 0..6 {
+        submit_tx(&http_origin, &txs[ctr]);
+        if !wait_for_microblocks(&microblocks_processed, 60) {
             break;
         }
         ctr += 1;
@@ -2184,7 +2950,7 @@ fn size_overflow_unconfirmed_invalid_stream_microblocks_integration_test() {
             let tx_bytes = hex_bytes(&raw_tx[2..]).unwrap();
             let parsed = StacksTransaction::consensus_deserialize(&mut &tx_bytes[..]).unwrap();
             if let TransactionPayload::SmartContract(tsc) = parsed.payload {
-                if tsc.name.to_string().find("small-").is_some() {
+                if tsc.name.to_string().find("small").is_some() {
                     num_big_microblock_txs += 1;
                     total_big_txs_per_microblock += 1;
                 }
@@ -2352,6 +3118,10 @@ fn runtime_overflow_unconfirmed_microblocks_integration_test() {
     conf.node.microblock_frequency = 15000;
     conf.block_limit = BLOCK_LIMIT_MAINNET.clone();
 
+    conf.miner.min_tx_fee = 1;
+    conf.miner.first_attempt_time_ms = i64::max_value() as u64;
+    conf.miner.subsequent_attempt_time_ms = i64::max_value() as u64;
+
     test_observer::spawn();
     conf.events_observers.push(EventObserverConfig {
         endpoint: format!("localhost:{}", test_observer::EVENT_OBSERVER_PORT),
@@ -2460,7 +3230,7 @@ fn runtime_overflow_unconfirmed_microblocks_integration_test() {
                 if tsc.name.to_string().find("large-").is_some() {
                     num_big_anchored_txs += 1;
                     total_big_txs_per_block += 1;
-                } else if tsc.name.to_string().find("small-").is_some() {
+                } else if tsc.name.to_string().find("small").is_some() {
                     num_big_microblock_txs += 1;
                     total_big_txs_per_microblock += 1;
                 }
@@ -2516,6 +3286,10 @@ fn block_replay_integration_test() {
     conf.node.mine_microblocks = true;
     conf.node.wait_time_for_microblocks = 30000;
     conf.node.microblock_frequency = 5_000;
+
+    conf.miner.min_tx_fee = 1;
+    conf.miner.first_attempt_time_ms = i64::max_value() as u64;
+    conf.miner.subsequent_attempt_time_ms = i64::max_value() as u64;
 
     test_observer::spawn();
 
@@ -2967,6 +3741,10 @@ fn near_full_block_integration_test() {
     conf.node.wait_time_for_microblocks = 30000;
     conf.node.microblock_frequency = 1000;
 
+    conf.miner.min_tx_fee = 1;
+    conf.miner.first_attempt_time_ms = i64::max_value() as u64;
+    conf.miner.subsequent_attempt_time_ms = i64::max_value() as u64;
+
     let mut btcd_controller = BitcoinCoreController::new(conf.clone());
     btcd_controller
         .start_bitcoind()
@@ -3171,7 +3949,7 @@ fn pox_integration_test() {
     assert_eq!(pox_info.reward_slots as u32, pox_constants.reward_slots());
     assert_eq!(pox_info.next_cycle.reward_phase_start_block_height, 210);
     assert_eq!(pox_info.next_cycle.prepare_phase_start_block_height, 205);
-    assert_eq!(pox_info.next_cycle.min_increment_ustx, 20845173515333);
+    assert_eq!(pox_info.next_cycle.min_increment_ustx, 1250710410920);
     assert_eq!(
         pox_info.prepare_cycle_length as u32,
         pox_constants.prepare_length
@@ -4374,6 +5152,9 @@ fn atlas_stress_integration_test() {
         .initial_balances
         .append(&mut initial_balances.clone());
 
+    conf_bootstrap_node.miner.first_attempt_time_ms = u64::max_value();
+    conf_bootstrap_node.miner.subsequent_attempt_time_ms = u64::max_value();
+
     let user_1 = users.pop().unwrap();
     let initial_balance_user_1 = initial_balances.pop().unwrap();
 
@@ -4431,7 +5212,7 @@ fn atlas_stress_integration_test() {
     let tx_1 = make_contract_call(
         &user_1,
         0,
-        260,
+        1000,
         &StacksAddress::from_string("ST000000000000000000002AMW42H").unwrap(),
         "bns",
         "namespace-preorder",
@@ -4578,7 +5359,7 @@ fn atlas_stress_integration_test() {
             let tx_3 = make_contract_call(
                 &user_1,
                 2 + (batch_size * i + j) as u64,
-                500,
+                1000,
                 &StacksAddress::from_string("ST000000000000000000002AMW42H").unwrap(),
                 "bns",
                 "name-import",
@@ -4647,7 +5428,7 @@ fn atlas_stress_integration_test() {
     let tx_4 = make_contract_call(
         &user_1,
         2 + (batch_size as u64) * (batches as u64),
-        260,
+        1000,
         &StacksAddress::from_string("ST000000000000000000002AMW42H").unwrap(),
         "bns",
         "namespace-ready",
@@ -4707,7 +5488,7 @@ fn atlas_stress_integration_test() {
             let tx_5 = make_contract_call(
                 &users[batches * batch_size + j],
                 0,
-                500,
+                1000,
                 &StacksAddress::from_string("ST000000000000000000002AMW42H").unwrap(),
                 "bns",
                 "name-preorder",
@@ -4766,7 +5547,7 @@ fn atlas_stress_integration_test() {
             let tx_6 = make_contract_call(
                 &users[batches * batch_size + j],
                 1,
-                500,
+                1000,
                 &StacksAddress::from_string("ST000000000000000000002AMW42H").unwrap(),
                 "bns",
                 "name-register",
@@ -4829,7 +5610,7 @@ fn atlas_stress_integration_test() {
             let tx_7 = make_contract_call(
                 &users[batches * batch_size + j],
                 2,
-                500,
+                1000,
                 &StacksAddress::from_string("ST000000000000000000002AMW42H").unwrap(),
                 "bns",
                 "name-update",
@@ -4891,7 +5672,7 @@ fn atlas_stress_integration_test() {
             let tx_8 = make_contract_call(
                 &users[batches * batch_size + j],
                 3,
-                500,
+                1000,
                 &StacksAddress::from_string("ST000000000000000000002AMW42H").unwrap(),
                 "bns",
                 "name-renewal",
@@ -5016,10 +5797,9 @@ fn atlas_stress_integration_test() {
             // requests should take no more than 20ms
             assert!(
                 total_time < attempts * 50,
-                format!(
-                    "Atlas inventory request is too slow: {} >= {} * 50",
-                    total_time, attempts
-                )
+                "Atlas inventory request is too slow: {} >= {} * 50",
+                total_time,
+                attempts
             );
         }
 
@@ -5058,10 +5838,9 @@ fn atlas_stress_integration_test() {
             // requests should take no more than 40ms
             assert!(
                 total_time < attempts * 50,
-                format!(
-                    "Atlas chunk request is too slow: {} >= {} * 50",
-                    total_time, attempts
-                )
+                "Atlas chunk request is too slow: {} >= {} * 50",
+                total_time,
+                attempts
             );
         }
     }

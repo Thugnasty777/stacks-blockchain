@@ -1,4 +1,5 @@
 [node]
+# working_dir = "/dir/to/save/chainstate"
 rpc_bind = "0.0.0.0:20443"
 p2p_bind = "0.0.0.0:20444"
 seed = "<YOUR_SEED>"
@@ -10,9 +11,9 @@ bootstrap_node = "02da7a464ac770ae8337a343670778b93410f2f3fef6bea98dd1c3e9224459
 chain = "bitcoin"
 mode = "mainnet"
 peer_host = "127.0.0.1"
-rpc_port = 8332
-peer_port = 8333
 username = "<USERNAME>"
 password = "<PASSWORD>"
+rpc_port = 8332
+peer_port = 8333
 satoshis_per_byte = 100
 burn_fee_cap = 20000

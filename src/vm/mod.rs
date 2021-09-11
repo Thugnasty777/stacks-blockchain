@@ -27,7 +27,6 @@ pub mod types;
 pub mod contracts;
 
 pub mod ast;
-pub mod clarity;
 pub mod contexts;
 pub mod database;
 pub mod representations;
@@ -39,17 +38,19 @@ mod variables;
 pub mod analysis;
 pub mod docs;
 
+pub mod coverage;
+
 #[cfg(test)]
 pub mod tests;
 
+use crate::clarity_vm::database::MemoryBackingStore;
 use vm::callables::CallableType;
 use vm::contexts::GlobalContext;
-use vm::contexts::{CallStack, ContractContext, Environment, LocalContext};
+pub use vm::contexts::{CallStack, ContractContext, Environment, LocalContext};
 use vm::costs::{
     cost_functions, runtime_cost, CostOverflowingMath, CostTracker, LimitedCostTracker,
     MemoryConsumer,
 };
-use vm::database::MemoryBackingStore;
 use vm::errors::{
     CheckErrors, Error, InterpreterError, InterpreterResult as Result, RuntimeErrorType,
 };
@@ -207,6 +208,10 @@ pub fn eval<'a>(
         Atom, AtomValue, Field, List, LiteralValue, TraitReference,
     };
 
+    if let Some(ref mut coverage_tracker) = env.global_context.coverage_reporting {
+        coverage_tracker.report_eval(exp, &env.contract_context.contract_identifier);
+    }
+
     match exp.expr {
         AtomValue(ref value) | LiteralValue(ref value) => Ok(value.clone()),
         Atom(ref value) => lookup_variable(&value, context, env),
@@ -214,6 +219,14 @@ pub fn eval<'a>(
             let (function_variable, rest) = children
                 .split_first()
                 .ok_or(CheckErrors::NonFunctionApplication)?;
+
+            if let Some(ref mut coverage_tracker) = env.global_context.coverage_reporting {
+                coverage_tracker.report_eval(
+                    &function_variable,
+                    &env.contract_context.contract_identifier,
+                );
+            }
+
             let function_name = function_variable
                 .match_atom()
                 .ok_or(CheckErrors::BadFunctionName)?;
@@ -237,7 +250,7 @@ pub fn is_reserved(name: &str) -> bool {
 /* This function evaluates a list of expressions, sharing a global context.
  * It returns the final evaluated result.
  */
-fn eval_all(
+pub fn eval_all(
     expressions: &[SymbolicExpression],
     contract_context: &mut ContractContext,
     global_context: &mut GlobalContext,
@@ -367,10 +380,10 @@ pub fn execute(program: &str) -> Result<Option<Value>> {
 
 #[cfg(test)]
 mod test {
+    use crate::clarity_vm::database::MemoryBackingStore;
     use std::collections::HashMap;
     use vm::callables::{DefineType, DefinedFunction};
     use vm::costs::LimitedCostTracker;
-    use vm::database::MemoryBackingStore;
     use vm::errors::RuntimeErrorType;
     use vm::eval;
     use vm::execute;

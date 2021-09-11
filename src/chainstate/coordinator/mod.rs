@@ -21,23 +21,23 @@ use std::time::Duration;
 
 use burnchains::{
     db::{BurnchainBlockData, BurnchainDB},
-    Address, Burnchain, BurnchainBlockHeader, BurnchainHeaderHash, Error as BurnchainError, Txid,
+    Address, Burnchain, BurnchainBlockHeader, Error as BurnchainError, Txid,
 };
 use chainstate::burn::{
-    db::sortdb::{PoxId, SortitionDB, SortitionId},
-    operations::leader_block_commit::RewardSetInfo,
-    operations::BlockstackOperationType,
-    BlockHeaderHash, BlockSnapshot, ConsensusHash,
+    db::sortdb::SortitionDB, operations::leader_block_commit::RewardSetInfo,
+    operations::BlockstackOperationType, BlockSnapshot, ConsensusHash,
 };
+use chainstate::coordinator::comm::{
+    ArcCounterCoordinatorNotices, CoordinatorEvents, CoordinatorNotices, CoordinatorReceivers,
+};
+use chainstate::stacks::index::MarfTrieId;
 use chainstate::stacks::{
-    boot::boot_code_id,
     db::{
         accounts::MinerReward, ChainStateBootData, ClarityTx, MinerRewardInfo, StacksChainState,
         StacksHeaderInfo,
     },
     events::{StacksTransactionEvent, StacksTransactionReceipt, TransactionOrigin},
-    Error as ChainstateError, StacksAddress, StacksBlock, StacksBlockHeader, StacksBlockId,
-    TransactionPayload,
+    Error as ChainstateError, StacksBlock, TransactionPayload,
 };
 use monitoring::{
     increment_contract_calls_processed, increment_stx_blocks_processed_counter,
@@ -51,17 +51,17 @@ use vm::{
     Value,
 };
 
-pub mod comm;
-use chainstate::stacks::index::MarfTrieId;
-
-#[cfg(test)]
-pub mod tests;
+use crate::types::chainstate::{
+    BlockHeaderHash, BurnchainHeaderHash, PoxId, SortitionId, StacksAddress, StacksBlockHeader,
+    StacksBlockId,
+};
+use crate::util::boot::boot_code_id;
 
 pub use self::comm::CoordinatorCommunication;
 
-use chainstate::coordinator::comm::{
-    ArcCounterCoordinatorNotices, CoordinatorEvents, CoordinatorNotices, CoordinatorReceivers,
-};
+pub mod comm;
+#[cfg(test)]
+pub mod tests;
 
 /// The 3 different states for the current
 ///  reward cycle's relationship to its PoX anchor
@@ -120,6 +120,9 @@ pub trait BlockEventDispatcher {
         winner_txid: Txid,
         matured_rewards: Vec<MinerReward>,
         matured_rewards_info: Option<MinerRewardInfo>,
+        parent_burn_block_hash: BurnchainHeaderHash,
+        parent_burn_block_height: u32,
+        parent_burn_block_timestamp: u64,
     );
 
     /// called whenever a burn block is about to be
@@ -760,6 +763,9 @@ impl<'a, T: BlockEventDispatcher, N: CoordinatorNotices, U: RewardSetProvider>
                             winner_txid,
                             block_receipt.matured_rewards,
                             block_receipt.matured_rewards_info,
+                            block_receipt.parent_burn_block_hash,
+                            block_receipt.parent_burn_block_height,
+                            block_receipt.parent_burn_block_timestamp,
                         );
                     }
 

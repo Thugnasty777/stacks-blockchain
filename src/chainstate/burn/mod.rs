@@ -14,25 +14,9 @@
 // You should have received a copy of the GNU General Public License
 // along with this program.  If not, see <http://www.gnu.org/licenses/>.
 
-/// This module contains the code for processing the burn chain state database
-pub mod db;
-pub mod distribution;
-pub mod operations;
-pub mod sortition;
-
-pub const CONSENSUS_HASH_LIFETIME: u32 = 24;
-
 use std::convert::TryInto;
 use std::fmt;
 use std::io::Write;
-
-use burnchains::Address;
-use burnchains::BurnchainHeaderHash;
-use burnchains::PublicKey;
-use burnchains::Txid;
-
-use util::hash::{to_hex, Hash160};
-use util::vrf::VRFProof;
 
 use rand::seq::index::sample;
 use rand::Rng;
@@ -43,18 +27,29 @@ use rusqlite::Connection;
 use rusqlite::Transaction;
 use sha2::Sha256;
 
-use chainstate::burn::db::sortdb::{PoxId, SortitionHandleTx, SortitionId};
-
-use util::db::Error as db_error;
-
+use burnchains::Address;
+use burnchains::PublicKey;
+use burnchains::Txid;
+use chainstate::burn::db::sortdb::SortitionHandleTx;
 use core::SYSTEM_FORK_SET_VERSION;
-
+use util::db::Error as db_error;
 use util::hash::Hash32;
 use util::hash::Sha512Trunc256Sum;
+use util::hash::{to_hex, Hash160};
 use util::log;
 use util::uint::Uint256;
+use util::vrf::VRFProof;
 
-use chainstate::stacks::index::TrieHash;
+use crate::types::chainstate::{BlockHeaderHash, BurnchainHeaderHash, PoxId, SortitionId, VRFSeed};
+use crate::types::proof::TrieHash;
+
+/// This module contains the code for processing the burn chain state database
+pub mod db;
+pub mod distribution;
+pub mod operations;
+pub mod sortition;
+
+pub const CONSENSUS_HASH_LIFETIME: u32 = 24;
 
 pub struct ConsensusHash(pub [u8; 20]);
 impl_array_newtype!(ConsensusHash, u8, 20);
@@ -62,19 +57,17 @@ impl_array_hexstring_fmt!(ConsensusHash);
 impl_byte_array_newtype!(ConsensusHash, u8, 20);
 pub const CONSENSUS_HASH_ENCODED_SIZE: u32 = 20;
 
-pub struct BlockHeaderHash(pub [u8; 32]);
-impl_array_newtype!(BlockHeaderHash, u8, 32);
-impl_array_hexstring_fmt!(BlockHeaderHash);
-impl_byte_array_newtype!(BlockHeaderHash, u8, 32);
-impl_byte_array_serde!(BlockHeaderHash);
-pub const BLOCK_HEADER_HASH_ENCODED_SIZE: usize = 32;
+// operations hash -- the sha256 hash of a sequence of transaction IDs
+pub struct OpsHash(pub [u8; 32]);
+impl_array_newtype!(OpsHash, u8, 32);
+impl_array_hexstring_fmt!(OpsHash);
+impl_byte_array_newtype!(OpsHash, u8, 32);
 
-pub struct VRFSeed(pub [u8; 32]);
-impl_array_newtype!(VRFSeed, u8, 32);
-impl_array_hexstring_fmt!(VRFSeed);
-impl_byte_array_newtype!(VRFSeed, u8, 32);
-impl_byte_array_serde!(VRFSeed);
-pub const VRF_SEED_ENCODED_SIZE: u32 = 32;
+// rolling hash of PoW outputs to mix with the VRF seed on sortition
+pub struct SortitionHash(pub [u8; 32]);
+impl_array_newtype!(SortitionHash, u8, 32);
+impl_array_hexstring_fmt!(SortitionHash);
+impl_byte_array_newtype!(SortitionHash, u8, 32);
 
 impl VRFSeed {
     /// First-ever VRF seed from the genesis block.  It's all 0's
@@ -93,18 +86,6 @@ impl VRFSeed {
     }
 }
 
-// operations hash -- the sha256 hash of a sequence of transaction IDs
-pub struct OpsHash(pub [u8; 32]);
-impl_array_newtype!(OpsHash, u8, 32);
-impl_array_hexstring_fmt!(OpsHash);
-impl_byte_array_newtype!(OpsHash, u8, 32);
-
-// rolling hash of PoW outputs to mix with the VRF seed on sortition
-pub struct SortitionHash(pub [u8; 32]);
-impl_array_newtype!(SortitionHash, u8, 32);
-impl_array_hexstring_fmt!(SortitionHash);
-impl_byte_array_newtype!(SortitionHash, u8, 32);
-
 #[derive(Debug, Clone, PartialEq)]
 #[repr(u8)]
 pub enum Opcodes {
@@ -119,25 +100,39 @@ pub enum Opcodes {
 // a burnchain block snapshot
 #[derive(Debug, Clone, PartialEq)]
 pub struct BlockSnapshot {
+    /// the burn block height of this sortition
     pub block_height: u64,
     pub burn_header_timestamp: u64,
     pub burn_header_hash: BurnchainHeaderHash,
     pub parent_burn_header_hash: BurnchainHeaderHash,
     pub consensus_hash: ConsensusHash,
     pub ops_hash: OpsHash,
-    pub total_burn: u64, // how many burn tokens have been destroyed since genesis
-    pub sortition: bool, // whether or not a sortition happened in this block (will be false if there were no burns)
-    pub sortition_hash: SortitionHash, // rolling hash of the burn chain's block headers -- this gets mixed with the sortition VRF seed
-    pub winning_block_txid: Txid, // txid of the leader block commit that won sortition.  Will all 0's if sortition is false.
-    pub winning_stacks_block_hash: BlockHeaderHash, // hash of Stacks block that won sortition (will be all 0's if sortition is false)
-    pub index_root: TrieHash, // root hash of the index over the materialized view of all inserted data
-    pub num_sortitions: u64,  // how many stacks blocks exist
-    pub stacks_block_accepted: bool, // did we download, store, and incorporate the stacks block into the chain state
-    pub stacks_block_height: u64,    // if we accepted a block, this is its height
-    pub arrival_index: u64,          // this is the $(arrival_index)-th block to be accepted
-    pub canonical_stacks_tip_height: u64, // memoized canonical stacks chain tip
-    pub canonical_stacks_tip_hash: BlockHeaderHash, // memoized canonical stacks chain tip
-    pub canonical_stacks_tip_consensus_hash: ConsensusHash, // memoized canonical stacks chain tip
+    /// how many burn tokens have been destroyed since genesis
+    pub total_burn: u64,
+    /// whether or not a sortition happened in this block (will be false if there were no burns)
+    pub sortition: bool,
+    /// rolling hash of the burn chain's block headers -- this gets mixed with the sortition VRF seed
+    pub sortition_hash: SortitionHash,
+    /// txid of the leader block commit that won sortition.  Will all 0's if sortition is false.
+    pub winning_block_txid: Txid,
+    /// hash of Stacks block that won sortition (will be all 0's if sortition is false)
+    pub winning_stacks_block_hash: BlockHeaderHash,
+    /// root hash of the index over the materialized view of all inserted data
+    pub index_root: TrieHash,
+    /// how many stacks blocks exist
+    pub num_sortitions: u64,
+    /// did we download, store, and incorporate the stacks block into the chain state
+    pub stacks_block_accepted: bool,
+    /// if we accepted a block, this is its height
+    pub stacks_block_height: u64,
+    /// this is the $(arrival_index)-th block to be accepted
+    pub arrival_index: u64,
+    /// memoized canonical stacks chain tip
+    pub canonical_stacks_tip_height: u64,
+    /// memoized canonical stacks chain tip
+    pub canonical_stacks_tip_hash: BlockHeaderHash,
+    /// memoized canonical stacks chain tip
+    pub canonical_stacks_tip_consensus_hash: ConsensusHash,
     pub sortition_id: SortitionId,
     pub parent_sortition_id: SortitionId,
     pub pox_valid: bool,
@@ -384,23 +379,19 @@ impl ConsensusHash {
 
 #[cfg(test)]
 mod tests {
-
-    use super::*;
-
-    use chainstate::burn::db::sortdb::*;
-
-    use burnchains::BurnchainHeaderHash;
+    use rusqlite::Connection;
 
     use burnchains::bitcoin::address::BitcoinAddress;
     use burnchains::bitcoin::keys::BitcoinPublicKey;
-
+    use chainstate::burn::db::sortdb::*;
     use util::db::Error as db_error;
+    use util::get_epoch_time_secs;
     use util::hash::{hex_bytes, Hash160};
     use util::log;
 
-    use rusqlite::Connection;
+    use crate::types::chainstate::BurnchainHeaderHash;
 
-    use util::get_epoch_time_secs;
+    use super::*;
 
     #[test]
     fn get_prev_consensus_hashes() {

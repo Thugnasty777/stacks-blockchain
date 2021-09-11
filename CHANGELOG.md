@@ -5,6 +5,97 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to the versioning scheme outlined in the [README.md](README.md).
 
+## [Not Yet Released]
+
+This software update is a point-release to change the transaction selection
+logic in the default miner to prioritize by fee instead of nonce sequence.  This
+release's chainstate directory is compatible with chainstate directories from
+2.0.11.2.0.
+
+## Added
+
+- The node will enforce a soft deadline for mining a block, so that a node
+  operator can control how frequently their node attempts to mine a block
+regardless of how congested the mempool is.  The timeout parameters are
+controlled in the `[miner]` section of the node's config file (#2823).
+
+## Changed
+
+- Prioritize transaction inclusion in the mempool by transaction fee (#2823).
+
+## [2.0.11.2.0]
+
+NOTE: This change resets the `testnet`. Users running a testnet node will need
+to reset their chain states.
+
+### Added
+
+- `clarity-cli` will now also print a serialized version of the resulting
+  output from `eval` and `execute` commands. This serialization is in
+  hexademical string format and supports integration with other tools. (#2684)
+- The creation of a Bitcoin wallet with BTC version `> 0.19` is now supported
+  on a private testnet. (#2647)
+- `lcov`-compatible coverage reporting has been added to `clarity-cli` for
+  Clarity contract testing. (#2592)
+- The `README.md` file has new documentation about the release process. (#2726)
+
+### Changed
+
+- This change resets the testnet. (#2742)
+- Caching has been added to speed up `/v2/info` responses. (#2746)
+
+### Fixed
+
+- PoX syncing will only look back to the reward cycle prior to divergence,
+  instead of looking back over all history. This will speed up running a
+  follower node. (#2746)
+- The UTXO staleness check is re-ordered so that it occurs before the RBF-limit
+  check. This way, if stale UTXOs reached the "RBF limit" a miner will recover
+  by resetting the UTXO cache. (#2694)
+- Microblock events were being sent to the event observer when microblock data
+  was received by a peer, but were not emitted if the node mined the
+  microblocks itself. This made something like the private-testnet setup
+  incapable of emitting microblock events. Microblock events are now sent
+  even when self-mined. (#2653)
+- A bug is fixed in the mocknet/helium miner that would lead to a panic if a
+  burn block occurred without a sortition in it. (#2711)
+- Two bugs that caused problems syncing with the bitcoin chain during a
+  bitcoin reorg have been fixed (#2771, #2780).
+- Documentation is fixed in cases where string and buffer types are allowed
+  but not covered in the documentation.  (#2676)
+
+## [2.0.11.1.0]
+
+This software update is our monthly release. It introduces fixes and features for both developers and miners. 
+This release's chainstate directory is compatible with chainstate directories from 2.0.11.0.0.
+
+## Added
+
+- `/new_microblock` endpoint to notify event observers when a valid microblock
+  has been received (#2571).
+- Added new features to `clarity-cli` (#2597)
+- Exposing new mining-related metrics in prometheus (#2664)
+  - Miner's computed relative miner score as a percentage
+  - Miner's computed commitment, the min of their previous commitment and their median commitment
+  - Miner's current median commitment
+- Add `key-for-seed` command to the `stacks-node` binary - outputs the associated secret key hex string
+  and WIF formatted secret key for a given "seed" value (#2658).
+
+## Changed
+
+- Improved mempool walk order (#2514).
+- Renamed database `tx_tracking.db` to `tx_tracking.sqlite` (#2666).
+  
+## Fixed 
+
+- Alter the miner to prioritize spending the most recent UTXO when building a transaction, 
+  instead of the largest UTXO. In the event of a tie, it uses the smallest UTXO first (#2661).
+- Fix trait rpc lookups for implicitly implemented traits (#2602).
+- Fix `v2/pox` endpoint, broken on Mocknet (#2634).
+- Align cost limits on mocknet, testnet and mainnet (#2660). 
+- Log peer addresses in the HTTP server (#2667)
+- Mine microblocks if there are no recent unprocessed Stacks blocks
+
 ## [2.0.11.0.0]
 
 The chainstate directory has been restructured in this release. It is not

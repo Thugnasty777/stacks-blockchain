@@ -14,45 +14,40 @@
 // You should have received a copy of the GNU General Public License
 // along with this program.  If not, see <http://www.gnu.org/licenses/>.
 
-use chainstate::stacks::db::StacksChainState;
-use chainstate::stacks::Error;
-use chainstate::stacks::StacksAddress;
-use chainstate::stacks::StacksBlockHeader;
-use vm::database::ClarityDatabase;
-
-use address::AddressHashMode;
-use burnchains::bitcoin::address::BitcoinAddress;
-use burnchains::{Address, PoxConstants};
-
-use chainstate::burn::db::sortdb::SortitionDB;
-use core::{POX_MAXIMAL_SCALING, POX_THRESHOLD_STEPS_USTX};
-
-use vm::costs::{
-    cost_functions::ClarityCostFunction, ClarityCostFunctionReference, CostStateSummary,
-};
-use vm::representations::ClarityName;
-use vm::types::{
-    PrincipalData, QualifiedContractIdentifier, SequenceData, StandardPrincipalData, TupleData,
-    TypeSignature, Value,
-};
-
-use chainstate::stacks::index::marf::MarfConnection;
-use chainstate::stacks::StacksBlockId;
-
-use burnchains::Burnchain;
-
-use vm::clarity::ClarityConnection;
-use vm::contexts::ContractContext;
-use vm::database::{NULL_BURN_STATE_DB, NULL_HEADER_DB};
-use vm::representations::ContractName;
-
-use util::hash::Hash160;
-
 use std::boxed::Box;
 use std::cmp;
 use std::convert::TryFrom;
 use std::convert::TryInto;
 
+use address::AddressHashMode;
+use burnchains::bitcoin::address::BitcoinAddress;
+use burnchains::Burnchain;
+use burnchains::{Address, PoxConstants};
+use chainstate::burn::db::sortdb::SortitionDB;
+use chainstate::stacks::db::StacksChainState;
+use chainstate::stacks::index::marf::MarfConnection;
+use chainstate::stacks::Error;
+use clarity_vm::clarity::ClarityConnection;
+use core::{POX_MAXIMAL_SCALING, POX_THRESHOLD_STEPS_USTX};
+use util::hash::Hash160;
+use vm::contexts::ContractContext;
+use vm::costs::{
+    cost_functions::ClarityCostFunction, ClarityCostFunctionReference, CostStateSummary,
+};
+use vm::database::ClarityDatabase;
+use vm::database::{NULL_BURN_STATE_DB, NULL_HEADER_DB};
+use vm::representations::ClarityName;
+use vm::representations::ContractName;
+use vm::types::{
+    PrincipalData, QualifiedContractIdentifier, SequenceData, StandardPrincipalData, TupleData,
+    TypeSignature, Value,
+};
+
+use crate::types;
+use crate::types::chainstate::StacksAddress;
+use crate::types::chainstate::StacksBlockHeader;
+use crate::types::chainstate::StacksBlockId;
+use crate::util::boot;
 use crate::vm::{costs::LimitedCostTracker, SymbolicExpression};
 
 const BOOT_CODE_POX_BODY: &'static str = std::include_str!("pox.clar");
@@ -100,23 +95,6 @@ fn make_testnet_cost_voting() -> String {
             "(define-constant REQUIRED_VETOES u25)",
             1,
         )
-}
-
-#[cfg(test)]
-pub fn boot_code_test_addr() -> StacksAddress {
-    boot_code_addr(false)
-}
-
-pub fn boot_code_addr(mainnet: bool) -> StacksAddress {
-    StacksAddress::burn_address(mainnet)
-}
-
-pub fn boot_code_id(name: &str, mainnet: bool) -> QualifiedContractIdentifier {
-    let addr = boot_code_addr(mainnet);
-    QualifiedContractIdentifier::new(
-        addr.into(),
-        ContractName::try_from(name.to_string()).unwrap(),
-    )
 }
 
 pub fn make_contract_id(addr: &StacksAddress, name: &str) -> QualifiedContractIdentifier {
@@ -179,7 +157,7 @@ impl StacksChainState {
                 &stacks_block_id,
                 dbconn,
                 &iconn,
-                &boot_code_id(boot_contract_name, self.mainnet),
+                &boot::boot_code_id(boot_contract_name, self.mainnet),
                 code,
             )
             .map_err(Error::ClarityError)
@@ -221,7 +199,7 @@ impl StacksChainState {
     ) -> Result<u128, Error> {
         let function = "get-total-ustx-stacked";
         let mainnet = self.mainnet;
-        let contract_identifier = boot_code_id("pox", mainnet);
+        let contract_identifier = boot::boot_code_id("pox", mainnet);
         let cost_track = LimitedCostTracker::new_free();
         let sender = PrincipalData::Standard(StandardPrincipalData::transient());
         let result = self
@@ -453,6 +431,12 @@ mod contract_tests;
 
 #[cfg(test)]
 pub mod test {
+    use std::collections::{HashMap, HashSet};
+    use std::convert::From;
+    use std::fs;
+
+    use burnchains::Address;
+    use burnchains::PublicKey;
     use chainstate::burn::db::sortdb::*;
     use chainstate::burn::db::*;
     use chainstate::burn::operations::BlockstackOperationType;
@@ -463,25 +447,19 @@ pub mod test {
     use chainstate::stacks::miner::*;
     use chainstate::stacks::Error as chainstate_error;
     use chainstate::stacks::*;
-
-    use burnchains::Address;
-    use burnchains::PublicKey;
-
-    use super::*;
-
-    use net::test::*;
-
-    use util::*;
-
     use core::*;
+    use net::test::*;
+    use util::hash::to_hex;
+    use util::*;
     use vm::contracts::Contract;
     use vm::types::*;
 
-    use std::collections::{HashMap, HashSet};
-    use std::convert::From;
-    use std::fs;
+    use crate::util::boot::{boot_code_id, boot_code_test_addr};
+    use chainstate::stacks::C32_ADDRESS_VERSION_TESTNET_SINGLESIG;
 
-    use util::hash::to_hex;
+    use super::*;
+
+    pub const TESTNET_STACKING_THRESHOLD_25: u128 = 8000;
 
     #[test]
     fn make_reward_set_units() {
@@ -1589,7 +1567,7 @@ pub mod test {
                     chainstate.get_stacking_minimum(sortdb, &tip_index_block)
                 })
                 .unwrap();
-                assert_eq!(min_ustx, total_liquid_ustx / 480);
+                assert_eq!(min_ustx, total_liquid_ustx / TESTNET_STACKING_THRESHOLD_25);
 
                 // no reward addresses
                 let reward_addrs = with_sortdb(&mut peer, |ref mut chainstate, ref sortdb| {
@@ -1659,7 +1637,7 @@ pub mod test {
                         // miner rewards increased liquid supply, so less than 25% is locked.
                         // minimum participation decreases.
                         assert!(total_liquid_ustx > 4 * 1024 * POX_THRESHOLD_STEPS_USTX);
-                        assert_eq!(min_ustx, total_liquid_ustx / 480);
+                        assert_eq!(min_ustx, total_liquid_ustx / TESTNET_STACKING_THRESHOLD_25);
                     } else {
                         // still at 25% or more locked
                         assert!(total_liquid_ustx <= 4 * 1024 * POX_THRESHOLD_STEPS_USTX);
@@ -1838,7 +1816,7 @@ pub mod test {
                     chainstate.get_stacking_minimum(sortdb, &tip_index_block)
                 })
                 .unwrap();
-                assert_eq!(min_ustx, total_liquid_ustx / 480);
+                assert_eq!(min_ustx, total_liquid_ustx / TESTNET_STACKING_THRESHOLD_25);
 
                 // no reward addresses
                 let reward_addrs = with_sortdb(&mut peer, |ref mut chainstate, ref sortdb| {
@@ -1910,7 +1888,7 @@ pub mod test {
                         // miner rewards increased liquid supply, so less than 25% is locked.
                         // minimum participation decreases.
                         assert!(total_liquid_ustx > 4 * 1024 * POX_THRESHOLD_STEPS_USTX);
-                        assert_eq!(min_ustx, total_liquid_ustx / 480);
+                        assert_eq!(min_ustx, total_liquid_ustx / TESTNET_STACKING_THRESHOLD_25);
                     } else {
                         // still at 25% or more locked
                         assert!(total_liquid_ustx <= 4 * 1024 * POX_THRESHOLD_STEPS_USTX);
@@ -2054,7 +2032,7 @@ pub mod test {
                     chainstate.get_stacking_minimum(sortdb, &tip_index_block)
                 })
                 .unwrap();
-                assert_eq!(min_ustx, total_liquid_ustx / 480);
+                assert_eq!(min_ustx, total_liquid_ustx / TESTNET_STACKING_THRESHOLD_25);
 
                 // no reward addresses
                 let reward_addrs = with_sortdb(&mut peer, |ref mut chainstate, ref sortdb| {
@@ -2126,7 +2104,7 @@ pub mod test {
                             // miner rewards increased liquid supply, so less than 25% is locked.
                             // minimum participation decreases.
                             assert!(total_liquid_ustx > 4 * 1024 * POX_THRESHOLD_STEPS_USTX);
-                            assert_eq!(min_ustx, total_liquid_ustx / 480);
+                            assert_eq!(min_ustx, total_liquid_ustx / TESTNET_STACKING_THRESHOLD_25);
                         } else {
                             // still at 25% or more locked
                             assert!(total_liquid_ustx <= 4 * 1024 * POX_THRESHOLD_STEPS_USTX);
@@ -2331,7 +2309,7 @@ pub mod test {
                     chainstate.get_stacking_minimum(sortdb, &tip_index_block)
                 })
                 .unwrap();
-                assert_eq!(min_ustx, total_liquid_ustx / 480);
+                assert_eq!(min_ustx, total_liquid_ustx / TESTNET_STACKING_THRESHOLD_25);
 
                 // no reward addresses
                 let reward_addrs = with_sortdb(&mut peer, |ref mut chainstate, ref sortdb| {
@@ -2408,7 +2386,7 @@ pub mod test {
                     }
 
                     // well over 25% locked, so this is always true
-                    assert_eq!(min_ustx, total_liquid_ustx / 480);
+                    assert_eq!(min_ustx, total_liquid_ustx / TESTNET_STACKING_THRESHOLD_25);
 
                     // two reward addresses, and they're Alice's and Bob's.
                     // They are present in sorted order
@@ -2738,7 +2716,7 @@ pub mod test {
                     chainstate.get_stacking_minimum(sortdb, &tip_index_block)
                 })
                 .unwrap();
-                assert_eq!(min_ustx, total_liquid_ustx / 480);
+                assert_eq!(min_ustx, total_liquid_ustx / TESTNET_STACKING_THRESHOLD_25);
 
                 // no reward addresses
                 let reward_addrs = with_sortdb(&mut peer, |ref mut chainstate, ref sortdb| {
@@ -2806,7 +2784,7 @@ pub mod test {
                         // miner rewards increased liquid supply, so less than 25% is locked.
                         // minimum participation decreases.
                         assert!(total_liquid_ustx > 4 * 1024 * POX_THRESHOLD_STEPS_USTX);
-                        assert_eq!(min_ustx, total_liquid_ustx / 480);
+                        assert_eq!(min_ustx, total_liquid_ustx / TESTNET_STACKING_THRESHOLD_25);
                     }
 
                     if cur_reward_cycle == alice_reward_cycle {
@@ -2860,7 +2838,7 @@ pub mod test {
                         assert_eq!(reward_addrs.len(), 0);
 
                         // min STX is reset
-                        assert_eq!(min_ustx, total_liquid_ustx / 480);
+                        assert_eq!(min_ustx, total_liquid_ustx / TESTNET_STACKING_THRESHOLD_25);
 
                         // Unlock is lazy
                         let alice_account =
@@ -3061,7 +3039,7 @@ pub mod test {
                     chainstate.get_stacking_minimum(sortdb, &tip_index_block)
                 })
                 .unwrap();
-                assert_eq!(min_ustx, total_liquid_ustx / 480);
+                assert_eq!(min_ustx, total_liquid_ustx / TESTNET_STACKING_THRESHOLD_25);
 
                 // no reward addresses
                 assert_eq!(reward_addrs.len(), 0);
@@ -3097,7 +3075,7 @@ pub mod test {
                     chainstate.get_stacking_minimum(sortdb, &tip_index_block)
                 })
                 .unwrap();
-                assert_eq!(min_ustx, total_liquid_ustx / 480);
+                assert_eq!(min_ustx, total_liquid_ustx / TESTNET_STACKING_THRESHOLD_25);
 
                 // no reward addresses
                 assert_eq!(reward_addrs.len(), 0);
@@ -3120,13 +3098,13 @@ pub mod test {
                 // miner rewards increased liquid supply, so less than 25% is locked.
                 // minimum participation decreases.
                 assert!(total_liquid_ustx > 4 * 1024 * POX_THRESHOLD_STEPS_USTX);
-                assert_eq!(min_ustx, total_liquid_ustx / 480);
+                assert_eq!(min_ustx, total_liquid_ustx / TESTNET_STACKING_THRESHOLD_25);
             } else if tenure_id >= 1 && cur_reward_cycle < first_reward_cycle {
                 // still at 25% or more locked
                 assert!(total_liquid_ustx <= 4 * 1024 * POX_THRESHOLD_STEPS_USTX);
             } else if tenure_id < 1 {
                 // nothing locked yet
-                assert_eq!(min_ustx, total_liquid_ustx / 480);
+                assert_eq!(min_ustx, total_liquid_ustx / TESTNET_STACKING_THRESHOLD_25);
             }
 
             if first_reward_cycle > 0 && second_reward_cycle == 0 {
@@ -3228,7 +3206,7 @@ pub mod test {
                     assert_eq!(reward_addrs.len(), 0);
 
                     // min STX is reset
-                    assert_eq!(min_ustx, total_liquid_ustx / 480);
+                    assert_eq!(min_ustx, total_liquid_ustx / TESTNET_STACKING_THRESHOLD_25);
 
                     // Unlock is lazy
                     let alice_account = get_account(&mut peer, &key_to_stacks_addr(&alice).into());
@@ -3358,7 +3336,7 @@ pub mod test {
                     assert_eq!(reward_addrs.len(), 0);
 
                     // min STX is reset
-                    assert_eq!(min_ustx, total_liquid_ustx / 480);
+                    assert_eq!(min_ustx, total_liquid_ustx / TESTNET_STACKING_THRESHOLD_25);
 
                     // Unlock is lazy
                     let alice_account = get_account(&mut peer, &key_to_stacks_addr(&alice).into());
@@ -3698,7 +3676,7 @@ pub mod test {
                         assert_eq!(balance, expected_balance);
                     }
                 }
-                assert_eq!(min_ustx, total_liquid_ustx / 480);
+                assert_eq!(min_ustx, total_liquid_ustx / TESTNET_STACKING_THRESHOLD_25);
 
                 // no reward addresses
                 let reward_addrs = with_sortdb(&mut peer, |ref mut chainstate, ref sortdb| {
@@ -3814,7 +3792,7 @@ pub mod test {
                     assert_eq!(reward_addrs.len(), 0);
 
                     // min STX is reset
-                    assert_eq!(min_ustx, total_liquid_ustx / 480);
+                    assert_eq!(min_ustx, total_liquid_ustx / TESTNET_STACKING_THRESHOLD_25);
                 }
             }
 
@@ -4014,7 +3992,7 @@ pub mod test {
                     assert_eq!(alice_account.stx_balance.unlock_height, 0);
                 }
 
-                assert_eq!(min_ustx, total_liquid_ustx / 480);
+                assert_eq!(min_ustx, total_liquid_ustx / TESTNET_STACKING_THRESHOLD_25);
 
                 // no reward addresses
                 assert_eq!(reward_addrs.len(), 0);
@@ -4070,7 +4048,7 @@ pub mod test {
                         // miner rewards increased liquid supply, so less than 25% is locked.
                         // minimum participation decreases.
                         assert!(total_liquid_ustx > 4 * 1024 * POX_THRESHOLD_STEPS_USTX);
-                        assert_eq!(min_ustx, total_liquid_ustx / 480);
+                        assert_eq!(min_ustx, total_liquid_ustx / TESTNET_STACKING_THRESHOLD_25);
                     } else {
                         // still at 25% or more locked
                         assert!(total_liquid_ustx <= 4 * 1024 * POX_THRESHOLD_STEPS_USTX);

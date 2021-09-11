@@ -43,7 +43,6 @@ name = "block_limits"
 harness = false
 
 [dependencies]
-tini = "0.2"
 rand = "=0.7.2"
 rand_chacha = "=0.2.2"
 serde = "1"
@@ -111,7 +110,8 @@ sha2-asm = "0.5.3"
 
 [workspace]
 members = [
-    ".", 
+    ".",
+    "clarity",
     "stx-genesis",
     "testnet/stacks-node",
     "testnet/puppet-chain"]
