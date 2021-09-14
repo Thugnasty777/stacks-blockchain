@@ -35,7 +35,7 @@ jobs:
       - name: Checkout latest docs
         uses: actions/checkout@v2
         with:
-          token: ${{ secrets.DOCS_GITHUB_TOKEN }}
+          token: ${{ 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 }}
           repository: ${{ env.TARGET_REPOSITORY }}
           path: docs.blockstack
 
