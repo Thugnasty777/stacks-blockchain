@@ -35,7 +35,7 @@
     "@stacks/transactions": "^1.4.1",
     "bn": "^1.0.5",
     "ripemd160": "^2.0.2",
-    "sha.js": "^2.4.11"
+    "sha.js": "^2.4.12"
   },
   "devDependencies": {
     "@babel/core": "^7.12.3",
